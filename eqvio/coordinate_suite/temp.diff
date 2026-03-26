@@ -1,0 +1,118 @@
+--- euclid.py	2026-03-22 21:45:29.364099877 +0800
++++ euclid.py.old	2026-03-22 00:39:35.881093026 +0800
+@@ -25,7 +25,7 @@
+ from liepp import SO3, SE3, SOT3
+ 
+ from eqvio.mathematical.vio_state import (
+-    VIOState, VIOSensorState, Landmark, PlaneLandmark, GRAVITY_CONSTANT,
++    VIOState, VIOSensorState, Landmark, GRAVITY_CONSTANT,
+ )
+ from eqvio.mathematical.vio_group import (
+     VIOGroup, VIOAlgebra, state_group_action,
+@@ -53,9 +53,7 @@
+     Reference: sensorChart_std + pointChart_euclid in VIOState.cpp
+     """
+     N = len(xi.camera_landmarks)
+-    M = len(xi.plane_landmarks)
+-    S = VIOSensorState.CDim
+-    eps = np.zeros(S + 3 * N + 3 * M)
++    eps = np.zeros(VIOSensorState.CDim + 3 * N)
+ 
+     # Sensor state
+     eps[0:6] = xi.sensor.input_bias - xi0.sensor.input_bias
+@@ -63,19 +61,12 @@
+     eps[12:15] = xi.sensor.velocity - xi0.sensor.velocity
+     eps[15:21] = SE3.log(xi0.sensor.camera_offset.inverse() * xi.sensor.camera_offset)
+ 
+-    # Point landmarks (Euclidean)
++    # Landmarks (Euclidean)
+     for i in range(N):
+-        eps[S + 3 * i:S + 3 * (i + 1)] = (
++        eps[VIOSensorState.CDim + 3 * i:VIOSensorState.CDim + 3 * (i + 1)] = (
+             xi.camera_landmarks[i].p - xi0.camera_landmarks[i].p
+         )
+ 
+-    # Plane landmarks (Euclidean on CP, NEW)
+-    plane_offset = S + 3 * N
+-    for i in range(M):
+-        eps[plane_offset + 3 * i:plane_offset + 3 * (i + 1)] = (
+-            xi.plane_landmarks[i].q - xi0.plane_landmarks[i].q
+-        )
+-
+     return eps
+ 
+ 
+@@ -101,14 +92,8 @@
+         p_new = xi0.camera_landmarks[i].p + eps[VSS.CDim + 3 * i:VSS.CDim + 3 * (i + 1)]
+         xi.camera_landmarks.append(Landmark(p=p_new, id=xi0.camera_landmarks[i].id))
+ 
+-    # Plane landmarks (NEW)
+-    plane_offset = VSS.CDim + 3 * N
+-    xi.plane_landmarks = []
+-    for i, pl0 in enumerate(xi0.plane_landmarks):
+-        q_new = pl0.q + eps[plane_offset + 3 * i:plane_offset + 3 * (i + 1)]
+-        xi.plane_landmarks.append(
+-            PlaneLandmark(q=q_new, id=pl0.id, point_ids=list(pl0.point_ids))
+-        )
++    # Planes (passthrough)
++    xi.plane_landmarks = list(xi0.plane_landmarks)
+ 
+     return xi
+ 
+@@ -198,36 +183,6 @@
+         A_qi = -Qhat_i @ inner @ Qhat_i_inv_mat / qq
+         A0t[S + 3 * i:S + 3 * (i + 1), S + 3 * i:S + 3 * (i + 1)] = A_qi
+ 
+-    # ===================================================================
+-    # Plane landmark blocks (NEW)
+-    # ===================================================================
+-    M = len(xi0.plane_landmarks)
+-    P = S + 3 * N  # plane block offset in state vector
+-
+-    for j in range(M):
+-        Qj = X.Q_planes[j]
+-        Qhat_j = Qj.R.asMatrix() * Qj.a             # 3x3: a*R
+-        Qhat_j_inv = Qj.inverse()
+-        Qhat_j_inv_mat = Qhat_j_inv.R.asMatrix() * Qhat_j_inv.a  # (1/a)*R^{-1}
+-        qhat_j = xi_hat.plane_landmarks[j].q
+-        q0j = xi0.plane_landmarks[j].q
+-        R_Qj = Qj.R.asMatrix()
+-
+-        # --- Plane self-block (validated to 7e-5 against numerical A) ---
+-        A_pj = Qhat_j @ np.outer(qhat_j, v_C) @ Qhat_j_inv_mat
+-        A0t[P + 3 * j:P + 3 * (j + 1), P + 3 * j:P + 3 * (j + 1)] = A_pj
+-
+-        # --- Velocity → plane ---
+-        A0t[P + 3 * j:P + 3 * (j + 1), 12:15] = (
+-            np.outer(qhat_j, qhat_j) @ Qhat_j @ R_IC.T @ R_Ahat.T
+-        )
+-
+-        # --- Camera offset → plane ---
+-        temp_plane = np.zeros((3, 6))
+-        temp_plane[:, 0:3] = -_skew(qhat_j) @ R_Qj
+-        temp_plane[:, 3:6] = np.outer(qhat_j, qhat_j) @ Qhat_j
+-        A0t[P + 3 * j:P + 3 * (j + 1), 15:21] = temp_plane @ common_term
+-
+     return A0t
+ 
+ 
+@@ -274,19 +229,6 @@
+             Qhat_i @ (_skew(qhat_i) @ R_IC_T + R_IC_T @ _skew(x_IC))
+         )
+ 
+-    # Plane landmark B rows (NEW)
+-    M = len(xi0.plane_landmarks)
+-    P = S + 3 * N
+-    for j in range(M):
+-        Qj = X.Q_planes[j]
+-        Qhat_j = Qj.R.asMatrix() * Qj.a
+-        qhat_j = xi_hat.plane_landmarks[j].q
+-        # Plane B: same structure as points but with outer(q,q) scaling
+-        Bt[P + 3 * j:P + 3 * (j + 1), 0:3] = (
+-            Qhat_j @ (-_skew(qhat_j) @ R_IC_T
+-                       - np.outer(qhat_j, qhat_j) @ R_IC_T @ _skew(x_IC))
+-        )
+-
+     return Bt
+ 
+ 

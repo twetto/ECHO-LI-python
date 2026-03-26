@@ -1,0 +1,33 @@
+# EqVIO-P configuration for EuRoC MAV dataset
+# Reference: EQVIO_config_template.yaml in C++ codebase
+
+dataset:
+  type: asl         # EuRoC format
+  path: null        # set at runtime
+
+filter:
+  coordinate_chart: euclid
+  use_planes: false          # enable in step 5
+
+  # Noise parameters
+  sigma_gyroscope: 1.6968e-04
+  sigma_accelerometer: 2.0e-3
+  sigma_gyroscope_bias: 1.9393e-05
+  sigma_accelerometer_bias: 3.0e-3
+
+  # Measurement noise
+  sigma_bearing: 0.01        # pixel noise (radians on unit sphere)
+  sigma_constraint: 0.01     # plane constraint pseudo-measurement
+
+  # Feature management
+  max_landmarks: 30
+  min_feature_distance: 20   # pixels
+
+  # Plane detection (step 6)
+  plane_detection:
+    enabled: false
+    interval_frames: 5
+    min_cluster_size: 5
+    ransac_threshold: 0.02   # meters
+
+gravity: [0.0, 0.0, -9.81]

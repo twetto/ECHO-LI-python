@@ -1,0 +1,162 @@
+--- vio_filter.py.old3	2026-03-23 01:54:06.424094025 +0800
++++ vio_filter.py	2026-03-23 01:53:22.754845314 +0800
+@@ -109,14 +109,11 @@
+     outlier_mahalanobis_threshold: float = 5.0  # chi2 threshold per feature (2 DOF)
+ 
+     # Plane settings (NEW)
+-    #sigma_constraint: float = 0.50       # constraint noise std (meters)
+-    sigma_constraint: float = 1e-4       # constraint noise std (meters)
+-    #sigma_constraint: float = 1000       # constraint noise std (meters)
+-    #initial_plane_variance: float = 1.0  # initial CP covariance (per axis)
+-    initial_plane_variance: float = 1e-3  # initial CP covariance (per axis)
++    sigma_constraint: float = 0.50       # constraint noise std (meters)
++    initial_plane_variance: float = 1.0  # initial CP covariance (per axis)
+     process_plane: float = 0.0003        # plane process noise (similar to point)
+-    #process_plane: float = 3e-2          # plane process noise (similar to point)
+     min_plane_points: int = 4            # remove plane if fewer points remain
++    constraint_update_interval: int = 1  # apply constraints every N vision frames
+ 
+     # Camera offset (body-to-camera SE(3))
+     camera_offset: SE3 = field(default_factory=SE3.Identity)
+@@ -313,6 +310,7 @@
+         self._pending_imu: List[IMUVelocity] = []
+         self._cached_input_gain = settings.input_gain_matrix()
+         self._cached_state_gain = settings.state_gain_matrix(xi0.dim())
++        self._vision_count: int = 0
+ 
+     def _invalidate_gain_cache(self):
+         """Recompute gain matrices after landmark count changes."""
+@@ -486,12 +484,18 @@
+             return
+ 
+         n_obs = len(y_ids)
++        self._vision_count += 1
+ 
+         if self.eqf.xi0.plane_landmarks:
+-            # Stacked bearing + constraint update (NEW)
++            # When planes are in state, always use stacked path for correct
++            # dimensions. Only include constraint rows every Nth frame.
++            use_constraints = (
++                self._vision_count % self.settings.constraint_update_interval == 0
++            )
+             self._stacked_vision_update(
+                 y_ids, measurement.cam_coordinates,
+                 measurement.camera_ptr or camera,
++                include_constraints=use_constraints,
+             )
+         else:
+             # Standard bearing-only update
+@@ -538,12 +542,16 @@
+ 
+     def _stacked_vision_update(
+         self, y_ids: List[int], y_coords: Dict[int, np.ndarray], cam_ptr,
++        include_constraints: bool = True,
+     ):
+         """Combined bearing + constraint Kalman update.
+ 
+         Called when plane landmarks are in the state. Assembles bearing rows
+-        for all observed points plus constraint rows for points on planes,
+-        then performs a single Kalman update.
++        for all observed points plus (optionally) constraint rows for points
++        on planes, then performs a single Kalman update.
++
++        The stacked path is always used when planes are in state to ensure
++        the output matrix has correct dimensions (including plane columns).
+         """
+         residual, C_star, R_noise = build_stacked_update(
+             xi0=self.eqf.xi0,
+@@ -555,6 +563,7 @@
+             sigma_bearing=self.settings.sigma_bearing,
+             sigma_constraint=self.settings.sigma_constraint,
+             use_equivariance=self.settings.use_equivariant_output,
++            include_constraints=include_constraints,
+         )
+ 
+         self.eqf.perform_stacked_update(
+@@ -569,7 +578,7 @@
+     def augment_planes(
+         self,
+         plane_cps: Dict[int, np.ndarray],
+-        feat2plane: Dict[int, int],
++        plane_inliers: Dict[int, List[int]],
+     ):
+         """Augment filter state with new plane landmarks.
+ 
+@@ -577,31 +586,30 @@
+         Only augments planes not already in the state.
+ 
+         Args:
+-            plane_cps:   {plane_id: cp_inG} from fit_detected_planes
+-            feat2plane:  {feature_id: plane_id} from PlaneDetector
++            plane_cps:      {plane_id: cp_inG} from fit_detected_planes
++            plane_inliers:  {plane_id: [feat_ids]} RANSAC inlier IDs per plane
+         """
+         existing_plane_ids = set(self.eqf.X.plane_id)
+         active_pt_ids = set(self.eqf.X.id)
+ 
+         new_planes = []
+         for pid, cp_global in plane_cps.items():
++            if pid not in plane_inliers:
++                continue
++
++            inlier_ids = plane_inliers[pid]
++
+             if pid in existing_plane_ids:
+-                # Update point_ids for existing planes
++                # Update point_ids for existing planes (only add inliers)
+                 for pl in self.eqf.xi0.plane_landmarks:
+                     if pl.id == pid:
+-                        new_pts = [
+-                            fid for fid, plid in feat2plane.items()
+-                            if plid == pid and fid in active_pt_ids
+-                        ]
++                        new_pts = [fid for fid in inlier_ids if fid in active_pt_ids]
+                         pl.point_ids = list(set(pl.point_ids) | set(new_pts))
+                         break
+                 continue
+ 
+-            # Collect point ids on this plane that are in the filter state
+-            point_ids_on_plane = [
+-                fid for fid, plid in feat2plane.items()
+-                if plid == pid and fid in active_pt_ids
+-            ]
++            # Use RANSAC inliers that are in the filter state
++            point_ids_on_plane = [fid for fid in inlier_ids if fid in active_pt_ids]
+ 
+             if len(point_ids_on_plane) < self.settings.min_plane_points:
+                 continue
+@@ -639,25 +647,6 @@
+             # Filter CP: q_cam = n_C / d_C
+             q_cam = n_C / d_C
+ 
+-            '''
+-            # DEBUG: trace the transform
+-            print(f"\n=== DEBUG plane {pid} ===")
+-            print(f"  cp_global = {cp_global}")
+-            print(f"  abcd = {abcd}  (n_G={n_G}, d_G={d_G})")
+-            print(f"  n_C = {n_C},  d_C = {d_C}")
+-            print(f"  q_cam = {q_cam}")
+-            # Check a few points
+-            for fid in point_ids_on_plane[:3]:
+-                lm_idx = next(
+-                    (i for i, lm in enumerate(xi_hat.camera_landmarks) if lm.id == fid),
+-                    None
+-                )
+-                if lm_idx is not None:
+-                    p_cam = xi_hat.camera_landmarks[lm_idx].p
+-                    res = q_cam @ p_cam + 1.0
+-                    print(f"  pt {fid}: p_cam={p_cam}, q·p+1={res:.4f}")
+-            '''
+-
+             # Sanity check: verify constraint is approximately satisfied
+             # for associated points already in the state
+             max_residual = 0.0
+@@ -672,8 +661,6 @@
+                     max_residual = max(max_residual, res)
+             if max_residual > 0.5:
+                 # CP doesn't match the points — skip this plane
+-                #print(f"max residual: {max_residual}")
+-                #print(f"plane {pid} rejected")
+                 continue
+ 
+             new_planes.append(PlaneLandmark(
