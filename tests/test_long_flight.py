@@ -222,9 +222,61 @@ def rotate_camera_around_gravity(theta_radians):
     return R_new
 
 def make_pose(x, y=0., altitude=60.0, yaw=0.):
-    #return SE3(R=SO3(matrix=R_DOWN), x=np.array([x, y, altitude]))
     return SE3(R=SO3(matrix=rotate_camera_around_gravity(yaw)), x=np.array([x, y, altitude]))
 
+def get_trajectory(t, speed, altitude):
+    """Generates a trajectory with mathematically exact sinusoidal excitation."""
+    # 1. Translation
+    x = speed * t
+    y = 5.0 * np.sin(0.2 * t)
+    z = altitude
+
+    ax = 0.0
+    ay = -5.0 * (0.2**2) * np.sin(0.2 * t)
+    az = 0.0
+
+    # 2. Rotation
+    pitch_amp, pitch_freq = 0.01, 1.0  
+    #pitch_amp, pitch_freq = 0.0, 0.0
+    roll_amp, roll_freq = 0.01, 1.3    
+    #roll_amp, roll_freq = 0.0, 0.0
+    yaw_amp, yaw_freq = 0.01, 1.3    
+    #yaw_amp, yaw_freq = 0.0, 0.0
+
+    pitch = pitch_amp * np.sin(pitch_freq * t)
+    dpitch = pitch_amp * pitch_freq * np.cos(pitch_freq * t)
+
+    roll = roll_amp * np.sin(roll_freq * t)
+    droll = roll_amp * roll_freq * np.cos(roll_freq * t)
+
+    yaw = yaw_amp * np.sin(yaw_freq * t)
+    dyaw = yaw_amp * yaw_freq * np.cos(yaw_freq * t)
+
+    R_DOWN = np.array([[1, 0, 0], [0, -1, 0], [0, 0, -1]], dtype=float)
+
+    cp, sp = np.cos(pitch), np.sin(pitch)
+    cr, sr = np.cos(roll), np.sin(roll)
+    cy, sy = np.cos(yaw), np.sin(yaw)
+
+    Rx = np.array([[1, 0, 0], [0, cr, -sr], [0, sr, cr]]) 
+    Ry = np.array([[cp, 0, sp], [0, 1, 0], [-sp, 0, cp]]) 
+    Rz = np.array([[cy, -sy,  0], [sy,  cy,  0], [0,  0,  1]])
+
+    R_CtoW = Rz @ Ry @ Rx @ R_DOWN
+    R_WtoC = R_CtoW.T
+
+    # Analytic Angular Velocity
+    w_world = np.array([0, dpitch, 0]) + Ry @ np.array([droll, 0, 0]) + Rz @ np.array([0, 0, dyaw])
+    gyr_body = R_WtoC @ w_world
+
+    # Analytic Specific Force
+    acc_world = np.array([ax, ay, az])
+    gravity_world = np.array([0.0, 0.0, 9.80665])
+    acc_body = R_WtoC @ (acc_world + gravity_world)
+
+    pose = SE3(R=SO3(matrix=R_CtoW), x=np.array([x, y, z]))
+
+    return pose, gyr_body, acc_body
 
 def scatter_canopy(x_range=(-50, 250), y_range=(-30, 30),
                    density=0.05, tree_height_std=2.0, seed=42):
@@ -333,7 +385,6 @@ def gt_augment(vio, all_canopy_pts):
 def run_sim(plane_mode='none', sigma_constraint=0.1,
             tree_height_std=2.0, altitude=60.0,
             speed=2.0, duration=100.0, dt=0.05,
-            #sigma_px=0.5, seed=42, verbose=False, visualize=False):
             sigma_px=0.1, seed=42, verbose=False, visualize=False):
     np.random.seed(seed)
     camera = PinholeCamera()
@@ -357,6 +408,7 @@ def run_sim(plane_mode='none', sigma_constraint=0.1,
     s.outlier_mahalanobis_threshold = 1e6
     s.sigma_constraint = sigma_constraint
     s.initial_plane_variance = 1.0
+    s.coordinate_choice = 'InvDepth'
 
     vio = VIOFilter(s)
     vio.eqf.xi0.sensor.pose = make_pose(0.0, 0.0, altitude + 2.0)
@@ -372,21 +424,14 @@ def run_sim(plane_mode='none', sigma_constraint=0.1,
 
     for i in range(n_steps):
         t = i * dt
-        omega = 0.5
-        yaw = omega * t
-        x = speed * t
-        y = 5.0 * np.sin(0.2 * t)  # slight lateral wobble
+
+        # Get the excited trajectory
+        true_pose, gyr_body, acc_body = get_trajectory(t, speed, altitude)
         
-        true_pose = make_pose(x, y, altitude, yaw=yaw)
-        R_WtoB = true_pose.R.asMatrix().T
-        acc_world = np.array([0.0, -0.2 * np.sin(0.2 * t), 0.0])
-        gravity_world = np.array([0.0, 0.0, 9.80665])
-        specific_force_world = acc_world + gravity_world
-        acc_body = R_WtoB @ specific_force_world
-        w_world = np.array([0.0, 0.0, omega]) 
-        gyr_body = R_WtoB @ w_world
-        
-        imu = IMUVelocity(stamp=t, gyr=gyr_body, acc=acc_body,
+        # Add the true biases to the sensor measurements
+        imu = IMUVelocity(stamp=t, 
+                          gyr=gyr_body, 
+                          acc=acc_body,
                           gyr_bias_vel=np.zeros(3), acc_bias_vel=np.zeros(3))
 
         vio.process_imu(imu)
@@ -435,7 +480,7 @@ def run_sim(plane_mode='none', sigma_constraint=0.1,
 
         if vis:
             vis.update(state, true_pose)
-            #vis.wait(100)
+            #vis.wait(1000)
 
         # Record metrics
         state = vio.state_estimate()
@@ -454,7 +499,7 @@ def run_sim(plane_mode='none', sigma_constraint=0.1,
             n_pl = len(state.plane_landmarks)
             nc = sum(len(pl.point_ids) for pl in state.plane_landmarks)
             n_vis = len(true_visible)
-            print(f"  t={t:5.1f}s x={x:6.1f}m: lm={len(state.camera_landmarks):2d} "
+            print(f"  t={t:5.1f}s: lm={len(state.camera_landmarks):2d} "
                   f"vis={n_vis:2d} planes={n_pl} constr={nc:2d} "
                   f"pos={pe:.2f} z={ze:.2f} lm_err={lm_errors[-1]:.1f}")
 
@@ -488,7 +533,7 @@ def main():
     print("=" * 75)
     print("  Long-flight canopy: 60m alt, 200m traverse, landmark turnover")
     print("=" * 75)
-    duration = 30.0
+    duration = 100.0
 
     for tree_std in [2.0]:
         print(f"\n{'='*75}")
