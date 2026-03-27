@@ -454,44 +454,45 @@ def lift_velocity_discrete(state: VIOState, velocity, dt: float) -> VIOGroup:
     '''
     
     # --- Alternative fast logic begins --- #
-    ids = [lm.id for lm in state.camera_landmarks]
-    p0_array = np.array([lm.p for lm in state.camera_landmarks]) # Shape: N x 3
-    R_mat = camera_pose_change_inv.R.asMatrix() # 3x3 array
-    x_vec = camera_pose_change_inv.x            # 3-element array
-    p1_array = (R_mat @ p0_array.T).T + x_vec
-    norm_p0 = np.linalg.norm(p0_array, axis=1, keepdims=True)
-    norm_p1 = np.linalg.norm(p1_array, axis=1, keepdims=True)
-    a_array = (norm_p0 / norm_p1).flatten()
-    o = p1_array / norm_p1 
-    d = p0_array / norm_p0 
-    axes = np.cross(o, d)
-    axis_norms = np.linalg.norm(axes, axis=1, keepdims=True)
-    dots = np.sum(o * d, axis=1)
-    angles = np.arccos(np.clip(dots, -1.0, 1.0)) 
-    rot_vecs = np.zeros_like(axes)
-    mask_normal = (axis_norms.flatten() >= 1e-10)
-    rot_vecs[mask_normal] = (axes[mask_normal] / axis_norms[mask_normal]) * angles[mask_normal, np.newaxis]
-    
-    # Edge cases (parallel/antiparallel)
-    mask_zero = ~mask_normal
-    for i in np.where(mask_zero)[0]:
-        if angles[i] >= np.pi / 2:
-            perp = np.array([1.0, 0.0, 0.0]) if abs(o[i, 0]) < 0.9 else np.array([0.0, 1.0, 0.0])
-            ax = np.cross(o[i], perp)
-            ax = ax / np.linalg.norm(ax)
-            rot_vecs[i] = np.pi * ax
-    
-    batched_rotations = Rotation.from_rotvec(rot_vecs)
-    for i in range(len(ids)):
-        r = SO3()
-        r.rotation = batched_rotations[i] 
+    if len(state.camera_landmarks) > 0:
+        ids = [lm.id for lm in state.camera_landmarks]
+        p0_array = np.array([lm.p for lm in state.camera_landmarks]) # Shape: N x 3
+        R_mat = camera_pose_change_inv.R.asMatrix() # 3x3 array
+        x_vec = camera_pose_change_inv.x            # 3-element array
+        p1_array = (R_mat @ p0_array.T).T + x_vec
+        norm_p0 = np.linalg.norm(p0_array, axis=1, keepdims=True)
+        norm_p1 = np.linalg.norm(p1_array, axis=1, keepdims=True)
+        a_array = (norm_p0 / norm_p1).flatten()
+        o = p1_array / norm_p1 
+        d = p0_array / norm_p0 
+        axes = np.cross(o, d)
+        axis_norms = np.linalg.norm(axes, axis=1, keepdims=True)
+        dots = np.sum(o * d, axis=1)
+        angles = np.arccos(np.clip(dots, -1.0, 1.0)) 
+        rot_vecs = np.zeros_like(axes)
+        mask_normal = (axis_norms.flatten() >= 1e-10)
+        rot_vecs[mask_normal] = (axes[mask_normal] / axis_norms[mask_normal]) * angles[mask_normal, np.newaxis]
         
-        t = SOT3()
-        t.R = r
-        t.a = a_array[i] 
+        # Edge cases (parallel/antiparallel)
+        mask_zero = ~mask_normal
+        for i in np.where(mask_zero)[0]:
+            if angles[i] >= np.pi / 2:
+                perp = np.array([1.0, 0.0, 0.0]) if abs(o[i, 0]) < 0.9 else np.array([0.0, 1.0, 0.0])
+                ax = np.cross(o[i], perp)
+                ax = ax / np.linalg.norm(ax)
+                rot_vecs[i] = np.pi * ax
         
-        lift.Q.append(t)
-        lift.id.append(ids[i])
+        batched_rotations = Rotation.from_rotvec(rot_vecs)
+        for i in range(len(ids)):
+            r = SO3()
+            r.rotation = batched_rotations[i] 
+            
+            t = SOT3()
+            t.R = r
+            t.a = a_array[i] 
+            
+            lift.Q.append(t)
+            lift.id.append(ids[i])
     # --- Alternative fast logic ends --- #
 
     # Plane landmark discrete lifts (NEW)
