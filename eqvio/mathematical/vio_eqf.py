@@ -9,6 +9,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import List, Optional, Callable
 import numpy as np
+import scipy.linalg
 from copy import deepcopy
 
 from liepp import SOT3
@@ -104,10 +105,10 @@ class VIO_eqf:
         self.Sigma = 0.5 * (self.Sigma + self.Sigma.T)
 
         # Clamp minimum eigenvalue (prevents negative eigenvalues from roundoff)
-        #min_eig = 1e-12
-        #eigvals = np.linalg.eigvalsh(self.Sigma)
-        #if eigvals[0] < min_eig:
-        #    self.Sigma += (min_eig - eigvals[0]) * np.eye(self.Sigma.shape[0])
+        # min_eig = 1e-12
+        # eigvals = np.linalg.eigvalsh(self.Sigma)
+        # if eigvals[0] < min_eig:
+        #     self.Sigma += (min_eig - eigvals[0]) * np.eye(self.Sigma.shape[0])
         np.fill_diagonal(self.Sigma, self.Sigma.diagonal() + 1e-12)
 
     # -----------------------------------------------------------------------
@@ -173,8 +174,7 @@ class VIO_eqf:
 
         # Kalman gain
         S = Ct @ self.Sigma @ Ct.T + output_gain
-        S_inv = np.linalg.inv(S)
-        K = self.Sigma @ Ct.T @ S_inv
+        K = scipy.linalg.solve(S, Ct @ self.Sigma, assume_a='pos').T
 
         # Correction in coordinates
         Gamma = K @ y_tilde
@@ -220,8 +220,7 @@ class VIO_eqf:
 
         # Kalman gain
         S = Ct @ self.Sigma @ Ct.T + R_noise
-        S_inv = np.linalg.inv(S)
-        K = self.Sigma @ Ct.T @ S_inv
+        K = scipy.linalg.solve(S, Ct @ self.Sigma, assume_a='pos').T
 
         # Correction in coordinates
         Gamma = K @ y_tilde

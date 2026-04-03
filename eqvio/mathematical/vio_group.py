@@ -268,11 +268,14 @@ def state_group_action(X: VIOGroup, state: VIOState) -> VIOState:
 
     # --- Fast alternative logic begins --- #
     if state.camera_landmarks:
-        quats = np.array([Qi.R.asQuaternion() for Qi in X.Q]) 
+        # quats = np.array([Qi.R.asQuaternion() for Qi in X.Q])
+        R_mats = np.array([Qi.R.asMatrix() for Qi in X.Q])
+        R_invs = R_mats.transpose(0, 2, 1)
         scales = np.array([Qi.a for Qi in X.Q])
         points = np.array([lm.p for lm in state.camera_landmarks])
-        batched_inv_rotations = Rotation.from_quat(quats).inv()
-        rotated_points = batched_inv_rotations.apply(points)
+        # batched_inv_rotations = Rotation.from_quat(quats).inv()
+        # rotated_points = batched_inv_rotations.apply(points)
+        rotated_points = (R_invs @ points[..., np.newaxis]).squeeze(-1)
         final_points = (1.0 / scales[:, np.newaxis]) * rotated_points
         new_state.camera_landmarks = [
             Landmark(p=final_points[i], id=state.camera_landmarks[i].id)
@@ -452,45 +455,48 @@ def lift_velocity_discrete(state: VIOState, velocity, dt: float) -> VIOGroup:
         lift.Q.append(Qi)
         lift.id.append(lm.id)
     '''
-    
+
     # --- Alternative fast logic begins --- #
     if len(state.camera_landmarks) > 0:
         ids = [lm.id for lm in state.camera_landmarks]
-        p0_array = np.array([lm.p for lm in state.camera_landmarks]) # Shape: N x 3
-        R_mat = camera_pose_change_inv.R.asMatrix() # 3x3 array
-        x_vec = camera_pose_change_inv.x            # 3-element array
+        p0_array = np.array([lm.p for lm in state.camera_landmarks])
+        R_mat = camera_pose_change_inv.R.asMatrix()
+        x_vec = camera_pose_change_inv.x
         p1_array = (R_mat @ p0_array.T).T + x_vec
         norm_p0 = np.linalg.norm(p0_array, axis=1, keepdims=True)
         norm_p1 = np.linalg.norm(p1_array, axis=1, keepdims=True)
         a_array = (norm_p0 / norm_p1).flatten()
-        o = p1_array / norm_p1 
-        d = p0_array / norm_p0 
-        axes = np.cross(o, d)
-        axis_norms = np.linalg.norm(axes, axis=1, keepdims=True)
-        dots = np.sum(o * d, axis=1)
-        angles = np.arccos(np.clip(dots, -1.0, 1.0)) 
-        rot_vecs = np.zeros_like(axes)
-        mask_normal = (axis_norms.flatten() >= 1e-10)
-        rot_vecs[mask_normal] = (axes[mask_normal] / axis_norms[mask_normal]) * angles[mask_normal, np.newaxis]
-        
-        # Edge cases (parallel/antiparallel)
-        mask_zero = ~mask_normal
-        for i in np.where(mask_zero)[0]:
-            if angles[i] >= np.pi / 2:
-                perp = np.array([1.0, 0.0, 0.0]) if abs(o[i, 0]) < 0.9 else np.array([0.0, 1.0, 0.0])
-                ax = np.cross(o[i], perp)
-                ax = ax / np.linalg.norm(ax)
-                rot_vecs[i] = np.pi * ax
-        
-        batched_rotations = Rotation.from_rotvec(rot_vecs)
+        o = p1_array / norm_p1
+        d = p0_array / norm_p0
+
+        # Vectorized quaternion from two vectors:
+        #   q = [cross(o, d),  1 + dot(o, d)]  then normalize
+        # This is exact — no arccos/sin/cos needed.
+        axes = np.cross(o, d)                        # N × 3
+        dots = np.sum(o * d, axis=1)                 # N
+        quats = np.column_stack([axes, 1.0 + dots])  # N × 4  [x,y,z,w]
+        quat_norms = np.linalg.norm(quats, axis=1, keepdims=True)
+
+        # Normal case: normalize
+        safe = (quat_norms.flatten() > 1e-10)
+        quats[safe] /= quat_norms[safe]
+
+        # Antiparallel case (dot ≈ -1): pick perpendicular axis, q = [axis, 0]
+        for i in np.where(~safe)[0]:
+            perp = np.array([1.0, 0.0, 0.0]) if abs(o[i, 0]) < 0.9 else np.array([0.0, 1.0, 0.0])
+            ax = np.cross(o[i], perp)
+            ax /= np.linalg.norm(ax)
+            quats[i] = np.array([ax[0], ax[1], ax[2], 0.0])
+
+        # Identity case (dot ≈ 1) is already handled: [~0, ~0, ~0, ~2] normalizes to [0,0,0,1]
+
         for i in range(len(ids)):
-            r = SO3()
-            r.rotation = batched_rotations[i] 
-            
+            r = SO3(quaternion=quats[i])
+
             t = SOT3()
             t.R = r
-            t.a = a_array[i] 
-            
+            t.a = a_array[i]
+
             lift.Q.append(t)
             lift.id.append(ids[i])
     # --- Alternative fast logic ends --- #

@@ -43,6 +43,19 @@ def _skew(v: np.ndarray) -> np.ndarray:
     ])
 
 
+def _batched_skew(v_arr: np.ndarray) -> np.ndarray:
+    """Vectorized skew-symmetric matrix: (N, 3) -> (N, 3, 3)."""
+    N = v_arr.shape[0]
+    S = np.zeros((N, 3, 3), dtype=np.float64)
+    S[:, 0, 1] = -v_arr[:, 2]
+    S[:, 0, 2] =  v_arr[:, 1]
+    S[:, 1, 0] =  v_arr[:, 2]
+    S[:, 1, 2] = -v_arr[:, 0]
+    S[:, 2, 0] = -v_arr[:, 1]
+    S[:, 2, 1] =  v_arr[:, 0]
+    return S
+
+
 # ---------------------------------------------------------------------------
 # Coordinate chart
 # ---------------------------------------------------------------------------
@@ -120,113 +133,100 @@ def state_chart_inv_euclid(eps: np.ndarray, xi0: VIOState) -> VIOState:
 def state_matrix_A_euclid(
     X: VIOGroup, xi0: VIOState, imu_vel: IMUVelocity
 ) -> np.ndarray:
-    """Equivariant filter state matrix A0t (Euclidean chart).
-
-    Reference: EqFStateMatrixA_euclid() in euclid.cpp
-
-    State layout:
-        [0,6) bias, [6,12) pose, [12,15) velocity,
-        [15,21) camera offset, [21+3i,...) landmarks
-    """
+    """Fully Vectorized EqF state matrix A0t (Euclidean chart)."""
     N = len(xi0.camera_landmarks)
+    M = len(xi0.plane_landmarks)
     dim = xi0.dim()
     A0t = np.zeros((dim, dim))
-    S = VIOSensorState.CDim  # 21
+    S = VIOSensorState.CDim
 
-    # --- Effect of bias on everything: A[:, 0:6] = -B[:, 0:6] ---
+    # --- Sensor State (Same as before) ---
     Bt = input_matrix_B_euclid(X, xi0)
     A0t[:, 0:6] = -Bt[:, 0:6]
-
-    # --- Effect of velocity on translation: A[9:12, 12:15] = I ---
     A0t[9:12, 12:15] = np.eye(3)
+    A0t[12:15, 6:9] = -GRAVITY_CONSTANT * _skew(xi0.sensor.gravity_dir())
 
-    # --- Effect of gravity cov on velocity: A[12:15, 6:9] ---
-    g_dir = xi0.sensor.gravity_dir()
-    A0t[12:15, 6:9] = -GRAVITY_CONSTANT * _skew(g_dir)
-
-    # --- Effect of camera offset cov on self: A[15:21, 15:21] ---
     xi_hat = state_group_action(X, xi0)
     v_est = imu_vel - xi_hat.sensor.input_bias
-    U_I = np.concatenate([v_est.gyr, xi_hat.sensor.velocity])  # se(3) velocity
+    U_I = np.concatenate([v_est.gyr, xi_hat.sensor.velocity])
 
-    # ad(Ad_{T_C^{-1}} Ad_{A_hat} U_I)
     Ad_Tc_inv = xi0.sensor.camera_offset.inverse().Adjoint()
     Ad_A = X.A.Adjoint()
     transformed = Ad_Tc_inv @ Ad_A @ U_I
     A0t[15:21, 15:21] = SE3.adjoint(transformed)
 
-    # --- Effect of velocity cov on landmarks ---
     R_IC = xi_hat.sensor.camera_offset.R.asMatrix()
     R_Ahat = X.A.R.asMatrix()
-    for i in range(N):
-        Qi = X.Q[i]
-        Qhat_i = Qi.R.asMatrix() * Qi.a  # 3x3: a * R
-        A0t[S + 3 * i:S + 3 * (i + 1), 12:15] = (
-            -Qhat_i @ R_IC.T @ R_Ahat.T
-        )
-
-    # --- Effect of camera offset cov on landmarks ---
-    Ad_Binv = X.B.inverse().Adjoint()
-    common_term = Ad_Binv @ SE3.adjoint(Ad_Tc_inv @ Ad_A @ U_I)  # 6x6
-    for i in range(N):
-        Qi = X.Q[i]
-        q0i = xi0.camera_landmarks[i].p
-        R_Qi = Qi.R.asMatrix()
-        # temp = [skew(q0i) @ R_Qi, -a_i * R_Qi]  shape (3, 6)
-        temp = np.zeros((3, 6))
-        temp[:, 0:3] = _skew(q0i) @ R_Qi
-        temp[:, 3:6] = -Qi.a * R_Qi
-        A0t[S + 3 * i:S + 3 * (i + 1), 15:21] = temp @ common_term
-
-    # --- Effect of landmark cov on landmark cov ---
-    U_C_full = xi_hat.sensor.camera_offset.inverse().Adjoint() @ U_I
+    common_term = X.B.inverse().Adjoint() @ SE3.adjoint(transformed)
+    U_C_full = Ad_Tc_inv @ U_I
     v_C = U_C_full[3:6]
-    for i in range(N):
-        Qi = X.Q[i]
-        Qhat_i = Qi.R.asMatrix() * Qi.a
-        Qhat_i_inv = Qi.inverse()
-        Qhat_i_inv_mat = Qhat_i_inv.R.asMatrix() * Qhat_i_inv.a
-        qhat_i = xi_hat.camera_landmarks[i].p
-        qq = qhat_i @ qhat_i
-
-        # A_qi = -Qhat * (skew(q)*skew(v) - 2*v*q^T + q*v^T) * Qhat^{-1} / ||q||^2
-        inner = (
-            _skew(qhat_i) @ _skew(v_C)
-            - 2 * np.outer(v_C, qhat_i)
-            + np.outer(qhat_i, v_C)
-        )
-        A_qi = -Qhat_i @ inner @ Qhat_i_inv_mat / qq
-        A0t[S + 3 * i:S + 3 * (i + 1), S + 3 * i:S + 3 * (i + 1)] = A_qi
 
     # ===================================================================
-    # Plane landmark blocks (NEW)
+    # Vectorized Point Landmarks
     # ===================================================================
-    M = len(xi0.plane_landmarks)
-    P = S + 3 * N  # plane block offset in state vector
+    if N > 0:
+        # Extract once to NumPy space
+        a_arr = np.array([Q.a for Q in X.Q])  # (N,)
+        R_arr = np.array([Q.R.asMatrix() for Q in X.Q])  # (N, 3, 3)
+        Qhat_arr = R_arr * a_arr[:, None, None]
 
-    for j in range(M):
-        Qj = X.Q_planes[j]
-        Qhat_j = Qj.R.asMatrix() * Qj.a             # 3x3: a*R
-        Qhat_j_inv = Qj.inverse()
-        Qhat_j_inv_mat = Qhat_j_inv.R.asMatrix() * Qhat_j_inv.a  # (1/a)*R^{-1}
-        qhat_j = xi_hat.plane_landmarks[j].q
-        q0j = xi0.plane_landmarks[j].q
-        R_Qj = Qj.R.asMatrix()
+        # --- Velocity -> Landmarks (Block Assignment) ---
+        M_vel = R_IC.T @ R_Ahat.T
+        A0t[S:S+3*N, 12:15] = -(Qhat_arr @ M_vel).reshape(3*N, 3)
 
-        # --- Plane self-block (validated to 7e-5 against numerical A) ---
-        A_pj = Qhat_j @ np.outer(qhat_j, v_C) @ Qhat_j_inv_mat
-        A0t[P + 3 * j:P + 3 * (j + 1), P + 3 * j:P + 3 * (j + 1)] = A_pj
+        # --- Camera Offset -> Landmarks ---
+        q0_arr = np.array([lm.p for lm in xi0.camera_landmarks])  # (N, 3)
+        skew_q0 = _batched_skew(q0_arr)  # (N, 3, 3)
 
-        # --- Velocity → plane ---
-        A0t[P + 3 * j:P + 3 * (j + 1), 12:15] = (
-            np.outer(qhat_j, qhat_j) @ Qhat_j @ R_IC.T @ R_Ahat.T
-        )
+        temp_arr = np.zeros((N, 3, 6))
+        temp_arr[:, :, 0:3] = skew_q0 @ R_arr
+        temp_arr[:, :, 3:6] = -Qhat_arr
+        A0t[S:S+3*N, 15:21] = (temp_arr @ common_term).reshape(3*N, 6)
 
-        # --- Camera offset → plane ---
-        temp_plane = np.zeros((3, 6))
-        temp_plane[:, 0:3] = -_skew(qhat_j) @ R_Qj
-        temp_plane[:, 3:6] = np.outer(qhat_j, qhat_j) @ Qhat_j
-        A0t[P + 3 * j:P + 3 * (j + 1), 15:21] = temp_plane @ common_term
+        # --- Landmark -> Landmark (Block Diagonal) ---
+        qhat_arr = np.array([lm.p for lm in xi_hat.camera_landmarks])
+        qq_arr = np.sum(qhat_arr**2, axis=1)
+        skew_qhat = _batched_skew(qhat_arr)
+        skew_vC = _skew(v_C)
+
+        term2 = 2.0 * (v_C.reshape(1, 3, 1) * qhat_arr.reshape(N, 1, 3))
+        term3 = qhat_arr.reshape(N, 3, 1) * v_C.reshape(1, 1, 3)
+        inner_arr = (skew_qhat @ skew_vC) - term2 + term3
+
+        Qhat_inv_arr = R_arr.transpose(0, 2, 1) / a_arr[:, None, None]
+        A_qi_arr = -(Qhat_arr @ inner_arr @ Qhat_inv_arr) / qq_arr[:, None, None]
+
+        for i in range(N):
+            A0t[S+3*i:S+3*i+3, S+3*i:S+3*i+3] = A_qi_arr[i]
+
+    # ===================================================================
+    # Vectorized Plane Landmarks
+    # ===================================================================
+    P = S + 3 * N
+    if M > 0:
+        a_p_arr = np.array([Q.a for Q in X.Q_planes])
+        R_p_arr = np.array([Q.R.asMatrix() for Q in X.Q_planes])
+        Qhat_p_arr = R_p_arr * a_p_arr[:, None, None]
+        Qhat_p_inv_arr = R_p_arr.transpose(0, 2, 1) / a_p_arr[:, None, None]
+
+        qhat_p_arr = np.array([lm.q for lm in xi_hat.plane_landmarks])
+        outer_qv = qhat_p_arr.reshape(M, 3, 1) * v_C.reshape(1, 1, 3)
+
+        # --- Plane -> Plane (Block Diagonal) ---
+        A_pj_arr = Qhat_p_arr @ outer_qv @ Qhat_p_inv_arr
+        for j in range(M):
+            A0t[P+3*j:P+3*j+3, P+3*j:P+3*j+3] = A_pj_arr[j]
+
+        # --- Velocity -> Plane ---
+        outer_qq = qhat_p_arr.reshape(M, 3, 1) * qhat_p_arr.reshape(M, 1, 3)
+        A0t[P:P+3*M, 12:15] = (outer_qq @ Qhat_p_arr @ M_vel).reshape(3*M, 3)
+
+        # --- Camera Offset -> Plane ---
+        skew_qhat_p = _batched_skew(qhat_p_arr)
+        temp_p = np.zeros((M, 3, 6))
+        temp_p[:, :, 0:3] = -skew_qhat_p @ R_p_arr
+        temp_p[:, :, 3:6] = outer_qq @ Qhat_p_arr
+        A0t[P:P+3*M, 15:21] = (temp_p @ common_term).reshape(3*M, 6)
 
     return A0t
 
@@ -236,13 +236,9 @@ def state_matrix_A_euclid(
 # ---------------------------------------------------------------------------
 
 def input_matrix_B_euclid(X: VIOGroup, xi0: VIOState) -> np.ndarray:
-    """Equivariant filter input matrix Bt (Euclidean chart).
-
-    Reference: EqFInputMatrixB_euclid() in euclid.cpp
-
-    Columns: [gyr(3), acc(3), gyr_bias_vel(3), acc_bias_vel(3)] = 12
-    """
+    """Fully Vectorized EqF input matrix Bt (Euclidean chart)."""
     N = len(xi0.camera_landmarks)
+    M = len(xi0.plane_landmarks)
     dim = xi0.dim()
     S = VIOSensorState.CDim
     Bt = np.zeros((dim, IMUVelocity.CDim))
@@ -250,42 +246,42 @@ def input_matrix_B_euclid(X: VIOGroup, xi0: VIOState) -> np.ndarray:
     xi_hat = state_group_action(X, xi0)
     R_A = X.A.R.asMatrix()
 
-    # Biases: rows [0,6), cols [6,12)
+    # --- Sensor State ---
     Bt[0:6, 6:12] = np.eye(6)
-
-    # Attitude: rows [6,9), cols [0,3)
     Bt[6:9, 0:3] = R_A
-
-    # Position: rows [9,12), cols [0,3)
     Bt[9:12, 0:3] = _skew(X.A.x) @ R_A
+    Bt[12:15, 0:3] = R_A @ _skew(xi_hat.sensor.velocity)
+    Bt[12:15, 3:6] = R_A
 
-    # Body-fixed velocity: rows [12,15)
-    Bt[12:15, 0:3] = R_A @ _skew(xi_hat.sensor.velocity)  # gyr
-    Bt[12:15, 3:6] = R_A                                    # acc
-
-    # Landmarks: rows [S+3i, S+3(i+1)), cols [0,3) (gyr only)
     R_IC_T = xi_hat.sensor.camera_offset.R.inverse().asMatrix()
     x_IC = xi_hat.sensor.camera_offset.x
-    for i in range(N):
-        Qi = X.Q[i]
-        Qhat_i = Qi.R.asMatrix() * Qi.a
-        qhat_i = xi_hat.camera_landmarks[i].p
-        Bt[S + 3 * i:S + 3 * (i + 1), 0:3] = (
-            Qhat_i @ (_skew(qhat_i) @ R_IC_T + R_IC_T @ _skew(x_IC))
-        )
+    term_x_IC = R_IC_T @ _skew(x_IC)  # (3,3)
 
-    # Plane landmark B rows (NEW)
-    M = len(xi0.plane_landmarks)
+    # --- Vectorized Point Landmarks ---
+    if N > 0:
+        a_arr = np.array([Q.a for Q in X.Q])
+        R_arr = np.array([Q.R.asMatrix() for Q in X.Q])
+        Qhat_arr = R_arr * a_arr[:, None, None]
+
+        qhat_arr = np.array([lm.p for lm in xi_hat.camera_landmarks])
+        skew_qhat = _batched_skew(qhat_arr)
+
+        inner = (skew_qhat @ R_IC_T) + term_x_IC
+        Bt[S:S+3*N, 0:3] = (Qhat_arr @ inner).reshape(3*N, 3)
+
+    # --- Vectorized Plane Landmarks ---
     P = S + 3 * N
-    for j in range(M):
-        Qj = X.Q_planes[j]
-        Qhat_j = Qj.R.asMatrix() * Qj.a
-        qhat_j = xi_hat.plane_landmarks[j].q
-        # Plane B: same structure as points but with outer(q,q) scaling
-        Bt[P + 3 * j:P + 3 * (j + 1), 0:3] = (
-            Qhat_j @ (-_skew(qhat_j) @ R_IC_T
-                       - np.outer(qhat_j, qhat_j) @ R_IC_T @ _skew(x_IC))
-        )
+    if M > 0:
+        a_p_arr = np.array([Q.a for Q in X.Q_planes])
+        R_p_arr = np.array([Q.R.asMatrix() for Q in X.Q_planes])
+        Qhat_p_arr = R_p_arr * a_p_arr[:, None, None]
+
+        qhat_p_arr = np.array([lm.q for lm in xi_hat.plane_landmarks])
+        skew_qhat_p = _batched_skew(qhat_p_arr)
+        outer_qq = qhat_p_arr.reshape(M, 3, 1) * qhat_p_arr.reshape(M, 1, 3)
+
+        inner_p = -(skew_qhat_p @ R_IC_T) - (outer_qq @ term_x_IC)
+        Bt[P:P+3*M, 0:3] = (Qhat_p_arr @ inner_p).reshape(3*M, 3)
 
     return Bt
 

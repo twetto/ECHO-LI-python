@@ -43,7 +43,7 @@ eqf:
     velocity: 0.025317333863551263
   settings:
     coordinateChoice: Euclidean
-    #coordinateChoice: InvDepth
+    # coordinateChoice: InvDepth
     fastRiccati: true
     useDiscreteInnovationLift: false
     useDiscreteVelocityLift: true
