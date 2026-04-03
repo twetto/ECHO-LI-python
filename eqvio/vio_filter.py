@@ -109,12 +109,13 @@ class VIOFilterSettings:
     outlier_mahalanobis_threshold: float = 5.0  # chi2 threshold per feature (2 DOF)
 
     # Plane settings (NEW)
-    #sigma_constraint: float = 0.50       # constraint noise std (meters)
-    sigma_constraint: float = 10.0       # constraint noise std (meters)
-    #initial_plane_variance: float = 1.0  # initial CP covariance (per axis)
-    initial_plane_variance: float = 100.0  # initial CP covariance (per axis)
+    sigma_constraint: float = 0.50       # constraint noise std (meters)
+    initial_plane_variance: float = 1.0  # initial CP covariance (per axis)
     process_plane: float = 0.0003        # plane process noise (similar to point)
     min_plane_points: int = 4            # remove plane if fewer points remain
+    constraint_update_interval: int = 1  # apply constraints every N vision frames
+    plane_max_point_var: float = 1.0     # only use points with var below this for plane detection
+    constraint_max_point_var: float = 0.0  # only constrain points with var below this (0=disabled)
 
     # Camera offset (body-to-camera SE(3))
     camera_offset: SE3 = field(default_factory=SE3.Identity)
@@ -282,6 +283,9 @@ class VIOFilter:
             _lift = lift_innovation_invdepth
             _lift_d = lift_innovation_discrete_invdepth
             _chart = state_chart_invdepth
+            # InvDepth chart: constraint C* needs conv_ind2euc
+            from .coordinate_suite.invdepth import conv_ind2euc
+            self._constraint_chart_jacobian = conv_ind2euc
         else:
             self.suite = EqFCoordinateSuite_euclid
             _A = state_matrix_A_euclid
@@ -289,6 +293,8 @@ class VIOFilter:
             _lift = lift_innovation_euclid
             _lift_d = lift_innovation_discrete_euclid
             _chart = state_chart_euclid
+            # Euclidean chart: no transform needed
+            self._constraint_chart_jacobian = None
 
         # Build initial origin state
         xi0 = VIOState()
@@ -490,9 +496,13 @@ class VIOFilter:
         if self.eqf.xi0.plane_landmarks:
             # When planes are in state, always use stacked path for correct
             # dimensions. Only include constraint rows every Nth frame.
+            use_constraints = (
+                self._vision_count % self.settings.constraint_update_interval == 0
+            )
             self._stacked_vision_update(
                 y_ids, measurement.cam_coordinates,
                 measurement.camera_ptr or camera,
+                include_constraints=use_constraints,
             )
         else:
             # Standard bearing-only update
@@ -539,6 +549,7 @@ class VIOFilter:
 
     def _stacked_vision_update(
         self, y_ids: List[int], y_coords: Dict[int, np.ndarray], cam_ptr,
+        include_constraints: bool = True,
     ):
         """Combined bearing + constraint Kalman update.
 
@@ -546,9 +557,23 @@ class VIOFilter:
         for all observed points plus (optionally) constraint rows for points
         on planes, then performs a single Kalman update.
 
-        The stacked path is always used when planes are in state to ensure
-        the output matrix has correct dimensions (including plane columns).
+        Points with covariance above constraint_max_point_var are excluded
+        from constraint rows (but still get bearing rows) to prevent
+        unconverged points from pulling the plane.
         """
+        # Filter: only constrain well-converged points
+        eligible_ids = None
+        if include_constraints and self.settings.constraint_max_point_var > 0:
+            eligible_ids = set()
+            for fid in y_ids:
+                try:
+                    pcov = self.eqf.get_landmark_cov_by_id(fid)
+                    var = np.trace(pcov) / 3.0
+                    if var <= self.settings.constraint_max_point_var:
+                        eligible_ids.add(fid)
+                except (StopIteration, KeyError):
+                    pass
+
         residual, C_star, R_noise = build_stacked_update(
             xi0=self.eqf.xi0,
             X=self.eqf.X,
@@ -559,6 +584,9 @@ class VIOFilter:
             sigma_bearing=self.settings.sigma_bearing,
             sigma_constraint=self.settings.sigma_constraint,
             use_equivariance=self.settings.use_equivariant_output,
+            include_constraints=include_constraints,
+            eligible_constraint_ids=eligible_ids,
+            point_chart_jacobian=self._constraint_chart_jacobian,
         )
 
         self.eqf.perform_stacked_update(
@@ -670,7 +698,13 @@ class VIOFilter:
             return
 
         n_new = len(new_planes)
-        new_cov = np.eye(3 * n_new) * self.settings.initial_plane_variance
+        new_cov = np.zeros((3 * n_new, 3 * n_new))
+        for k, pl in enumerate(new_planes):
+            # Scale covariance to ||q||²: a fraction of the CP magnitude squared.
+            # initial_plane_variance acts as the relative uncertainty (e.g. 0.01 = 10%)
+            q_norm_sq = np.dot(pl.q, pl.q)
+            var = self.settings.initial_plane_variance * q_norm_sq
+            new_cov[3*k:3*k+3, 3*k:3*k+3] = np.eye(3) * var
         self.eqf.add_new_plane_landmarks(new_planes, new_cov)
         self._invalidate_gain_cache()
 

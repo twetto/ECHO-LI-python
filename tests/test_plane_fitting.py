@@ -243,7 +243,7 @@ class TestFitDetectedPlanes:
             feat2plane[100 + i] = 1
             feat_pos[100 + i] = pts_b[i]
 
-        cps = fit_detected_planes(feat2plane, feat_pos, min_features=5)
+        cps, inliers = fit_detected_planes(feat2plane, feat_pos, min_features=5)
         assert 0 in cps
         assert 1 in cps
 
@@ -254,7 +254,7 @@ class TestFitDetectedPlanes:
         """Planes with too few features are skipped."""
         feat2plane = {0: 0, 1: 0, 2: 0}  # only 3 features
         feat_pos = {i: np.array([i, 0, 3.0]) for i in range(3)}
-        cps = fit_detected_planes(feat2plane, feat_pos, min_features=5)
+        cps, inliers = fit_detected_planes(feat2plane, feat_pos, min_features=5)
         assert len(cps) == 0
 
 

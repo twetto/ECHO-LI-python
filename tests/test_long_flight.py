@@ -30,9 +30,13 @@ from eqvio.plane_detection.plane_detector import landmarks_to_global
 
 
 # Visualizer helper
-import pyqtgraph as pg
-import pyqtgraph.opengl as gl
-from pyqtgraph.Qt import QtWidgets
+try:
+    import pyqtgraph as pg
+    import pyqtgraph.opengl as gl
+    from pyqtgraph.Qt import QtWidgets
+    HAS_VIS = True
+except ImportError:
+    HAS_VIS = False
 import time
 
 class SyntheticVisualiser:
@@ -179,7 +183,7 @@ class SyntheticVisualiser:
 
     def _key_pressed(self, event):
         """Toggle pause when the Spacebar is pressed."""
-        from PyQt5.QtCore import Qt
+        from PyQt6.QtCore import Qt
         if event.key() == Qt.Key_Space:
             self.paused = not self.paused
             if self.paused:
@@ -344,19 +348,25 @@ def ransac_augment(vio, camera, altitude, tree_height_std):
         vio.augment_planes({500: cp}, {500: inlier_fids})
 
 
-def gt_augment(vio, all_canopy_pts):
-    """GT plane augmentation (oracle)."""
+def gt_augment(vio, all_canopy_pts, true_pose):
+    """GT plane augmentation (oracle).
+
+    Uses TRUE pose to compute plane CP — simulates having a DEM or altimeter.
+    The estimated rotation is close enough, but the TRUE position is critical
+    to provide external altitude information the filter doesn't already have.
+    """
     xi_hat = vio.state_estimate()
     active = set(vio.eqf.X.id)
     existing = set(vio.eqf.X.plane_id)
 
-    T_WtoC = (xi_hat.sensor.pose * xi_hat.sensor.camera_offset).inverse()
-    R_WtoC = T_WtoC.R.asMatrix()
-    p_CinW = xi_hat.sensor.pose.x
+    # Use TRUE pose for the plane transform — this is the external info
+    T_WtoC_true = (true_pose * xi_hat.sensor.camera_offset).inverse()
+    R_WtoC = T_WtoC_true.R.asMatrix()
+    p_CinW_true = true_pose.x  # TRUE altitude
 
     n_W, d_W = np.array([0., 0., 1.]), 0.0
     n_C = R_WtoC @ n_W
-    d_C = d_W + n_W @ p_CinW
+    d_C = d_W + n_W @ p_CinW_true  # encodes TRUE ground distance
 
     if abs(d_C) < 0.1:
         return
@@ -371,9 +381,11 @@ def gt_augment(vio, all_canopy_pts):
             if pl.id == 300:
                 pl.point_ids = ids
     else:
+        q_norm_sq = np.dot(q_cam, q_cam)
+        var = vio.settings.initial_plane_variance * q_norm_sq
         vio.eqf.add_new_plane_landmarks(
             [PlaneLandmark(q=q_cam, id=300, point_ids=ids)],
-            np.eye(3) * vio.settings.initial_plane_variance
+            np.eye(3) * var
         )
         vio._invalidate_gain_cache()
 
@@ -385,7 +397,8 @@ def gt_augment(vio, all_canopy_pts):
 def run_sim(plane_mode='none', sigma_constraint=0.1,
             tree_height_std=2.0, altitude=60.0,
             speed=2.0, duration=100.0, dt=0.05,
-            sigma_px=0.1, seed=42, verbose=False, visualize=False):
+            #sigma_px=0.1, seed=42, verbose=False, visualize=False):
+            sigma_px=1.0, seed=42, verbose=False, visualize=False):
     np.random.seed(seed)
     camera = PinholeCamera()
 
@@ -397,17 +410,22 @@ def run_sim(plane_mode='none', sigma_constraint=0.1,
     )
     print(f"    Total canopy points: {len(canopy)}") if verbose else None
 
-    vis = SyntheticVisualiser(canopy, cam_dist=120.0, elevation=45) if visualize else None
+    vis = SyntheticVisualiser(canopy, cam_dist=120.0, elevation=45) if (visualize and HAS_VIS) else None
 
     s = VIOFilterSettings()
     s.camera_offset = SE3.Identity()
     s.initial_scene_depth = altitude
+    #s.initial_scene_depth = 30
     s.initial_point_variance = altitude ** 2
     s.sigma_bearing = sigma_px
     s.max_landmarks = 40
     s.outlier_mahalanobis_threshold = 1e6
     s.sigma_constraint = sigma_constraint
     s.initial_plane_variance = 1.0
+    #s.initial_plane_variance = 0.01
+    #s.constraint_max_point_var = s.initial_point_variance / 10  # gate new points
+    s.plane_max_point_var = 0.0001
+    s.constraint_max_point_var = 0.0005
     s.coordinate_choice = 'InvDepth'
 
     vio = VIOFilter(s)
@@ -450,6 +468,10 @@ def run_sim(plane_mode='none', sigma_constraint=0.1,
             for fid, px in true_visible.items()
         }
 
+        # Freeze landmarks after initial set
+        #if vc >= 5:
+        #    cam_coords = {fid: cam_coords[fid] for fid in cam_coords if fid in set(vio.eqf.X.id)}
+
         meas = VisionMeasurement(stamp=t)
         meas.cam_coordinates = cam_coords
         meas.camera_ptr = camera
@@ -461,7 +483,7 @@ def run_sim(plane_mode='none', sigma_constraint=0.1,
             vio.process_vision(meas, camera)
         except Exception as e:
             if verbose:
-                print(f"  t={t:.1f}: {e}")
+                print(f"  t={t:.1f}: EXCEPTION {type(e).__name__}: {e}")
             continue
 
         vc += 1
@@ -476,7 +498,7 @@ def run_sim(plane_mode='none', sigma_constraint=0.1,
         if plane_mode == 'ransac' and vc >= 3:
             ransac_augment(vio, camera, altitude, tree_height_std)
         elif plane_mode == 'gt' and vc >= 3:
-            gt_augment(vio, canopy)
+            gt_augment(vio, canopy, true_pose)
 
         if vis:
             vis.update(state, true_pose)
@@ -496,6 +518,7 @@ def run_sim(plane_mode='none', sigma_constraint=0.1,
         lm_errors.append(np.mean(errs) if errs else float('nan'))
 
         if verbose and (vc <= 5 or vc % 50 == 0):
+        #if verbose:
             n_pl = len(state.plane_landmarks)
             nc = sum(len(pl.point_ids) for pl in state.plane_landmarks)
             n_vis = len(true_visible)
@@ -533,7 +556,7 @@ def main():
     print("=" * 75)
     print("  Long-flight canopy: 60m alt, 200m traverse, landmark turnover")
     print("=" * 75)
-    duration = 100.0
+    duration = 30.0
 
     for tree_std in [2.0]:
         print(f"\n{'='*75}")
@@ -543,26 +566,33 @@ def main():
         print("\n  Baseline:")
         pe_b, ze_b, le_b, lc_b = run_sim(
             plane_mode='none', tree_height_std=tree_std,
+            duration=duration, verbose=False)
             #duration=duration, verbose=True)
-            duration=duration, verbose=True, visualize=True)
+            #duration=duration, verbose=True, visualize=True)
         rmse_b, zrmse_b = print_result("point-only", pe_b, ze_b, le_b)
 
         print("\n  GT plane:")
-        for sig in [0.5, 0.1]:
+        #for sig in [0.5, 0.1]:
+        for sig in [10.0, 5.0, 1.0, 0.5, 0.1]:
             pe, ze, le, lc = run_sim(
                 plane_mode='gt', sigma_constraint=sig,
                 tree_height_std=tree_std, duration=duration,
-                verbose=(sig == 0.1))
-                #verbose=(sig == 0.1), visualize=(sig==0.5))
+                #verbose=(sig == 0.1))
+                #verbose=(sig == 0.1), visualize=(sig==10.0))
+                #visualize=(sig==10.0))
+                )
             print_result(f"GT σ={sig}", pe, ze, le, rmse_b, zrmse_b)
+            #print_result(f"GT σ={sig}", pe, ze, le, 0, 0)
 
         print("\n  RANSAC plane:")
-        for sig in [0.5, 0.1]:
+        for sig in [10.0, 5.0, 1.0, 0.5, 0.1]:
             pe, ze, le, lc = run_sim(
                 plane_mode='ransac', sigma_constraint=sig,
                 tree_height_std=tree_std, duration=duration,
-                verbose=(sig == 0.1))
+                )
+                #verbose=(sig == 0.1))
             print_result(f"RANSAC σ={sig}", pe, ze, le, rmse_b, zrmse_b)
+            #print_result(f"RANSAC σ={sig}", pe, ze, le, 0, 0)
 
 
 if __name__ == "__main__":

@@ -120,6 +120,69 @@ def constraint_Ci_star_euclid(
 
 
 # ---------------------------------------------------------------------------
+# Chart-to-Euclidean Jacobians for constraint C* transformation
+# ---------------------------------------------------------------------------
+
+def conv_polar2euc(p0: np.ndarray) -> np.ndarray:
+    """3×3 Jacobian of the Polar(SOT3)-to-Euclidean coordinate change at p0.
+
+    The polar chart maps ε = [ε₁, ε₂, ε₃] to sot(3) via injection E:
+        [ε₁, ε₂, 0, ε₃] → (rotation around x, y; scale)
+
+    At ε=0 the Euclidean perturbation is:
+        δp = -[ε₁,ε₂,0] × p₀ - ε₃ · p₀
+
+    So the Jacobian is:
+        J[:, 0] = -e₁ × p₀ = skew(p₀) @ e₁
+        J[:, 1] = -e₂ × p₀ = skew(p₀) @ e₂
+        J[:, 2] = -p₀
+
+    This gives C*_polar = C*_euc @ J, which at convergence yields:
+        C*_polar ≈ [(q×p)_x, (q×p)_y, 1]
+    with the depth-independent third column — the key property.
+    """
+    J = np.zeros((3, 3))
+    J[:, 0:2] = _skew(p0)[:, 0:2]  # first two columns of skew(p0)
+    J[:, 2] = -p0
+    return J
+
+
+def constraint_Ci_star_for_chart(
+    p0: np.ndarray, Q_p: SOT3,
+    q0: np.ndarray, Q_q: SOT3,
+    point_chart_jacobian=None,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Constraint C* blocks adapted to the active point coordinate chart.
+
+    Computes C*_p in Euclidean coordinates first, then transforms to the
+    active chart via the chain rule:
+        C*_chart = C*_euc @ J_chart2euc(p0)
+
+    The plane C*_q is unaffected (planes always use Euclidean CP coords).
+
+    Args:
+        p0, Q_p, q0, Q_q: same as constraint_Ci_star_euclid
+        point_chart_jacobian: function(p0) -> (3,3) Jacobian mapping
+            chart perturbation to Euclidean perturbation.
+            None = Euclidean (identity transform).
+            Use conv_ind2euc for InvDepth, conv_polar2euc for Polar.
+
+    Returns:
+        C_p: (1, 3) — point columns in active chart
+        C_q: (1, 3) — plane columns (always Euclidean CP)
+    """
+    C_p_euc, C_q = constraint_Ci_star_euclid(p0, Q_p, q0, Q_q)
+
+    if point_chart_jacobian is not None:
+        J = point_chart_jacobian(p0)
+        C_p = (C_p_euc @ J).reshape(1, 3)
+    else:
+        C_p = C_p_euc
+
+    return C_p, C_q
+
+
+# ---------------------------------------------------------------------------
 # Stacked bearing + constraint update assembly
 # ---------------------------------------------------------------------------
 
@@ -133,27 +196,26 @@ def build_stacked_update(
     sigma_bearing: float,
     sigma_constraint: float,
     use_equivariance: bool = True,
+    include_constraints: bool = True,
+    eligible_constraint_ids: set = None,
+    point_chart_jacobian=None,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Assemble the full stacked bearing + constraint Kalman update.
 
     For each observed point:
         - 2 bearing rows (existing EqVIO)
-    For each observed point that lies on a plane in the state:
-        - 1 constraint row (NEW)
+    For each observed point that lies on a plane in the state (if include_constraints):
+        - 1 constraint row (NEW), only if point is in eligible_constraint_ids
 
-    Sensor state columns (0:21) are zero for both bearing and constraint
-    in the EqF framework.
+    When include_constraints=False, only bearing rows are produced but the
+    output matrix still has correct full-state width (including plane columns).
 
     Args:
-        xi0:                    origin state
-        X:                      observer group element
-        y_ids:                  observed landmark ids (sorted)
-        y_coords:               {id: pixel_coords}
-        cam_ptr:                camera model
-        output_matrix_Ci_star:  per-landmark bearing C*_ti function (from coordinate suite)
-        sigma_bearing:          bearing noise std
-        sigma_constraint:       constraint noise std
-        use_equivariance:       use C*_t (True) or C_t (False)
+        eligible_constraint_ids: if not None, only these point IDs get constraint
+            rows. If None, all plane-associated points are eligible.
+        point_chart_jacobian: function(p0) -> (3,3) Jacobian mapping chart
+            perturbation to Euclidean perturbation. None = Euclidean chart.
+            Use conv_ind2euc for InvDepth, conv_polar2euc for Polar/SOT(3).
 
     Returns:
         residual:   (n_rows,) stacked innovation vector
@@ -179,7 +241,17 @@ def build_stacked_update(
 
     # --- Count rows ---
     n_bearing = 2 * len(y_ids)
-    n_constraints = sum(1 for fid in y_ids if fid in point_to_plane_idx)
+
+    def _is_eligible(fid):
+        if not include_constraints:
+            return False
+        if fid not in point_to_plane_idx:
+            return False
+        if eligible_constraint_ids is not None and fid not in eligible_constraint_ids:
+            return False
+        return True
+
+    n_constraints = sum(1 for fid in y_ids if _is_eligible(fid))
     n_rows = n_bearing + n_constraints
 
     if n_rows == 0:
@@ -230,8 +302,8 @@ def build_stacked_update(
         R_noise[2 * obs_idx, 2 * obs_idx] = sigma_bearing ** 2
         R_noise[2 * obs_idx + 1, 2 * obs_idx + 1] = sigma_bearing ** 2
 
-        # --- Constraint row (if this point is on a plane) ---
-        if fid in point_to_plane_idx:
+        # --- Constraint row (if this point is eligible) ---
+        if _is_eligible(fid):
             pl_idx = point_to_plane_idx[fid]
             pl0 = xi0.plane_landmarks[pl_idx]
 
@@ -243,8 +315,11 @@ def build_stacked_update(
             p_hat = xi_hat.camera_landmarks[lm_idx].p
             q_hat_pl = xi_hat.plane_landmarks[pl_idx].q
 
-            # Constraint C* blocks
-            C_p, C_q = constraint_Ci_star_euclid(q0, Q_k, pl0.q, Q_pl)
+            # Constraint C* blocks — chart-aware
+            C_p, C_q = constraint_Ci_star_for_chart(
+                q0, Q_k, pl0.q, Q_pl,
+                point_chart_jacobian=point_chart_jacobian,
+            )
 
             # Place in stacked matrix
             # Point columns
@@ -253,8 +328,10 @@ def build_stacked_update(
             pl_col_start = S + 3 * M_pts + 3 * pl_idx
             C_star[constraint_row, pl_col_start:pl_col_start + 3] = C_q.ravel()
 
-            # Constraint residual
-            residual[constraint_row] = constraint_residual(p_hat, q_hat_pl)
+            # Constraint residual with 3σ clipping for linearization safety
+            raw_residual = constraint_residual(p_hat, q_hat_pl)
+            max_residual = 3.0 * sigma_constraint
+            residual[constraint_row] = np.clip(raw_residual, -max_residual, max_residual)
 
             # Constraint noise
             R_noise[constraint_row, constraint_row] = sigma_constraint ** 2

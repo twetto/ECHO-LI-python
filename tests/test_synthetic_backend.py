@@ -21,9 +21,13 @@ from eqvio.mathematical.vision_measurement import VisionMeasurement, measure_sys
 from eqvio.vio_filter import VIOFilter, VIOFilterSettings
 
 # Visualizer helper
-import pyqtgraph as pg
-import pyqtgraph.opengl as gl
-from pyqtgraph.Qt import QtWidgets
+try:
+    import pyqtgraph as pg
+    import pyqtgraph.opengl as gl
+    from pyqtgraph.Qt import QtWidgets
+    HAS_VIS = True
+except ImportError:
+    HAS_VIS = False
 import time
 
 class SyntheticVisualiser:
@@ -161,11 +165,8 @@ class SyntheticVisualiser:
         start_time = time.time()
         delay_sec = delay_ms / 1000.0
         
-        #while time.time() - start_time < delay_sec:
         while (time.time() - start_time < delay_sec) or self.paused:
-            # 1. Pump the Qt event loop so the 3D view remains interactive
             self.app.processEvents()
-            # 2. Tiny sleep to prevent the while loop from maxing out a CPU core
             time.sleep(0.005)
             
             if self.paused:
@@ -173,11 +174,13 @@ class SyntheticVisualiser:
 
     def _key_pressed(self, event):
         """Toggle pause when the Spacebar is pressed."""
-        from PyQt5.QtCore import Qt
+        from PyQt6.QtCore import Qt
         if event.key() == Qt.Key_Space:
             self.paused = not self.paused
             if self.paused:
                 print("Simulation paused. Press Space to resume.")
+
+
 
 class PinholeCamera:
     def __init__(self, fx=300., fy=300., cx=320., cy=240.):
@@ -203,8 +206,6 @@ def make_pose(x, y=0., z=1.5):
 
 def make_floor_points():
     pts = {}; fid = 1000
-    #for xi in np.linspace(1.0, 5.0, 5):
-    #    for yi in np.linspace(-1.0, 1.0, 4):
     for xi in np.linspace(0.0, 8.0, 6):
         for yi in np.linspace(-1.5, 1.5, 5):
             pts[fid] = np.array([xi, yi, 0.0]); fid += 1
@@ -212,8 +213,6 @@ def make_floor_points():
 
 def make_wall_points():
     pts = {}; fid = 2000
-    #for xi in np.linspace(1.0, 5.0, 5):
-    #    for zi in np.linspace(0.5, 2.5, 4):
     for xi in np.linspace(0.0, 8.0, 6):
         for zi in np.linspace(0.3, 2.5, 5):
             pts[fid] = np.array([xi, -2.0, zi]); fid += 1
@@ -264,7 +263,11 @@ def augment_gt_planes(vio, floor_pts, wall_pts):
 
     if new_planes:
         n = len(new_planes)
-        vio.eqf.add_new_plane_landmarks(new_planes, np.eye(3*n) * vio.settings.initial_plane_variance)
+        cov = np.zeros((3*n, 3*n))
+        for k, pl in enumerate(new_planes):
+            q_norm_sq = np.dot(pl.q, pl.q)
+            cov[3*k:3*k+3, 3*k:3*k+3] = np.eye(3) * vio.settings.initial_plane_variance * q_norm_sq
+        vio.eqf.add_new_plane_landmarks(new_planes, cov)
         vio._invalidate_gain_cache()
 
     # Update associations
@@ -290,9 +293,9 @@ def run_sim(use_planes=False, sigma_constraint=0.5, seed=42, verbose=False, visu
     s.outlier_mahalanobis_threshold = 1e6
     s.sigma_constraint = sigma_constraint
     s.initial_plane_variance = 1.0
+    s.constraint_max_point_var = s.initial_point_variance / 10  # gate new points
 
     vio = VIOFilter(s)
-    #vio.eqf.xi0.sensor.pose = make_pose(0.05, -0.03, 1.52)
     vio.eqf.xi0.sensor.pose = make_pose(-1.95, -0.03, 1.52)
 
     pos_errors, lm_errors = [], []
@@ -300,7 +303,6 @@ def run_sim(use_planes=False, sigma_constraint=0.5, seed=42, verbose=False, visu
 
     for i in range(200):
         t = i * 0.05
-        #true_pose = make_pose(x=0.5*t)
         true_pose = make_pose(x=-2.0 + 0.5*t)
 
         imu = IMUVelocity(stamp=t, gyr=np.zeros(3),
@@ -330,7 +332,6 @@ def run_sim(use_planes=False, sigma_constraint=0.5, seed=42, verbose=False, visu
 
         if vis:
             vis.update(state, true_pose)
-            vis.wait(1000)
 
         state = vio.state_estimate()
         pe = np.linalg.norm(state.sensor.pose.x - true_pose.x)
@@ -347,10 +348,6 @@ def run_sim(use_planes=False, sigma_constraint=0.5, seed=42, verbose=False, visu
                   f"planes={np_}, pts_on_planes={nc:2d}, "
                   f"pos_err={pe:.4f}, lm_err={lm_errors[-1]:.4f}")
 
-    if vis:
-        print("Simulation complete. Close the window to continue.")
-        pg.exec()
-
     return pos_errors, lm_errors
 
 
@@ -361,13 +358,11 @@ def main():
 
     print("\n--- Baseline (point-only) ---")
     pe_b, le_b = run_sim(use_planes=False, verbose=True)
-    #pe_b, le_b = run_sim(use_planes=False, verbose=True, visualize=True)
     rmse_b = np.sqrt(np.mean(np.array(pe_b)**2))
     print(f"  Pos RMSE: {rmse_b:.4f}  final: {pe_b[-1]:.4f}  lm: {le_b[-1]:.4f}")
 
     for sig in [0.5, 0.1, 0.05]:
         print(f"\n--- Planes σ={sig} ---")
-        #pe_p, le_p = run_sim(use_planes=True, sigma_constraint=sig, verbose=(sig==0.5))
         pe_p, le_p = run_sim(use_planes=True, sigma_constraint=sig, verbose=(sig==0.5), visualize=(sig==0.05))
         rmse_p = np.sqrt(np.mean(np.array(pe_p)**2))
         imp = (rmse_b - rmse_p) / rmse_b * 100

@@ -239,8 +239,11 @@ def generate_measurements(pose, camera, world_points, sigma_px=0.5):
 # GT plane augmentation (oracle, for comparison)
 # ---------------------------------------------------------------------------
 
-def augment_gt_plane(vio, canopy_pts, tree_height_std):
-    """Augment with GT canopy plane."""
+def augment_gt_plane(vio, canopy_pts, tree_height_std, true_pose):
+    """Augment with GT canopy plane.
+
+    Uses TRUE pose for distance computation — simulates DEM/altimeter.
+    """
     xi_hat = vio.state_estimate()
     active = set(vio.eqf.X.id)
     existing = set(vio.eqf.X.plane_id)
@@ -251,13 +254,14 @@ def augment_gt_plane(vio, canopy_pts, tree_height_std):
                 pl.point_ids = [f for f in canopy_pts if f in active]
         return
 
-    T_WtoC = (xi_hat.sensor.pose * xi_hat.sensor.camera_offset).inverse()
+    # Use TRUE pose for the plane transform
+    T_WtoC = (true_pose * xi_hat.sensor.camera_offset).inverse()
     R_WtoC = T_WtoC.R.asMatrix()
-    p_CinW = xi_hat.sensor.pose.x
+    p_CinW_true = true_pose.x  # TRUE altitude
 
     n_W, d_W = np.array([0., 0., 1.]), 0.0
     n_C = R_WtoC @ n_W
-    d_C = d_W + n_W @ p_CinW
+    d_C = d_W + n_W @ p_CinW_true
 
     if abs(d_C) < 0.1: return
 
@@ -265,7 +269,8 @@ def augment_gt_plane(vio, canopy_pts, tree_height_std):
     ids = [f for f in canopy_pts if f in active]
     if len(ids) < 4: return
 
-    plane_var = max(0.01, (tree_height_std / 60.0) ** 2)
+    q_norm_sq = np.dot(q_cam, q_cam)
+    plane_var = vio.settings.initial_plane_variance * q_norm_sq
     vio.eqf.add_new_plane_landmarks(
         [PlaneLandmark(q=q_cam, id=300, point_ids=ids)],
         np.eye(3) * plane_var
@@ -358,6 +363,10 @@ def run_sim(use_planes=False, plane_mode='gt', sigma_constraint=0.5,
     s.outlier_mahalanobis_threshold = 1e6
     s.sigma_constraint = sigma_constraint
     s.initial_plane_variance = 1.0
+    #s.constraint_max_point_var = s.initial_point_variance / 10  # gate new points
+    s.plane_max_point_var = 1e+1
+    s.constraint_max_point_var = 1e+1
+    #s.coordinate_choice = 'InvDepth'
 
     vio = VIOFilter(s)
     vio.eqf.xi0.sensor.pose = make_pose(0.0, 0.0, altitude + 2.0)
@@ -401,7 +410,7 @@ def run_sim(use_planes=False, plane_mode='gt', sigma_constraint=0.5,
 
         if use_planes and vc >= 3:
             if plane_mode == 'gt':
-                augment_gt_plane(vio, canopy, tree_height_std)
+                augment_gt_plane(vio, canopy, tree_height_std, true_pose)
             elif plane_mode == 'ransac':
                 n_det, n_fit = augment_ransac_plane(
                     vio, plane_detector, fitting_settings, camera
@@ -413,7 +422,6 @@ def run_sim(use_planes=False, plane_mode='gt', sigma_constraint=0.5,
 
         if vis:
             vis.update(state, true_pose)
-            vis.wait(1000)
 
         state = vio.state_estimate()
         pe = np.linalg.norm(state.sensor.pose.x - true_pose.x)
@@ -436,7 +444,7 @@ def run_sim(use_planes=False, plane_mode='gt', sigma_constraint=0.5,
     if vis:
         print("Simulation complete. Close the window to continue.")
         pg.exec()
-    
+
     return pos_errors, z_errors, lm_errors
 
 
@@ -453,7 +461,7 @@ def print_result(label, pe, ze, le, rmse_b=None, zrmse_b=None):
 
 
 def main():
-    sigma_px = 0.5
+    sigma_px = 0.2
 
     print("=" * 70)
     print(f"  Canopy Hovering: 60m alt, σ_px={sigma_px}")
@@ -477,7 +485,8 @@ def main():
         for sig in [1.0, 0.5, 0.1, 0.05]:
             pe, ze, le = run_sim(
                 use_planes=True, plane_mode='gt', sigma_constraint=sig,
-                tree_height_std=tree_std, sigma_px=sigma_px)
+                #tree_height_std=tree_std, sigma_px=sigma_px)
+                tree_height_std=tree_std, sigma_px=sigma_px, visualize=(sig == 0.5 and tree_std == 0.0))
             print_result(f"GT σ={sig:.2f}", pe, ze, le, rmse_b, zrmse_b)
 
         # RANSAC planes
@@ -486,8 +495,9 @@ def main():
             pe, ze, le = run_sim(
                 use_planes=True, plane_mode='ransac', sigma_constraint=sig,
                 tree_height_std=tree_std, sigma_px=sigma_px,
-                #verbose=(sig == 0.1 and tree_std == 2.0))
-                visualize=(sig == 0.1 and tree_std == 2.0))
+                verbose=(sig == 10.0 and tree_std == 0.0),
+                )
+                #visualize=(sig == 10.0 and tree_std == 2.0))
             print_result(f"RANSAC σ={sig:.2f}", pe, ze, le, rmse_b, zrmse_b)
 
 
