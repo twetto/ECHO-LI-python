@@ -210,3 +210,6 @@ __marimo__/
 eqvio_output*
 *.old*
 GT*.txt
+continue.sh
+log.txt
+temp/

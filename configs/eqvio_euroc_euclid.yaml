@@ -50,8 +50,8 @@ eqf:
     useEquivariantOutput: true
     #useFeaturePredictions: true
     useFeaturePredictions: false
-    useMedianDepth: false
-    #useMedianDepth: true
+    # useMedianDepth: false
+    useMedianDepth: true
   velocityNoise:
     acc: 0.012438843268295521
     accBias: 0.004462289865453429
@@ -60,3 +60,15 @@ eqf:
 main:
   writeState: true
   cameraLag: 0.00
+FlowDep:
+  image_scale: 0.25
+  enable_warmstart: true
+  dis_preset: ultrafast
+  dis_finest_scale: 0
+  grid_stride: 8
+  texture_mask: true
+  texture_threshold: 20
+  keyframe_flow_threshold: 0.0
+  max_keyframes: 2
+  grid_var_threshold: 0.1
+  process_invdepth_var: 0.1

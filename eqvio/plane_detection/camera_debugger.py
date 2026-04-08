@@ -66,6 +66,11 @@ class CameraDebugWindow:
         tri_normals: Optional[np.ndarray] = None,
         slam_feat_ids: Optional[Set[int]] = None,
         text_overlay: str = "",
+        grid_feat2plane: Optional[dict[int, int]] = None,
+        grid_feat_norms: Optional[dict[int, list]] = None,
+        grid_cols: int = 0,
+        grid_stride: int = 8,
+        grid_image_scale: float = 1.0,
     ):
         """Render one frame to the debug window.
 
@@ -124,6 +129,13 @@ class CameraDebugWindow:
         if self.mode >= 1 and slam_feat_ids:
             img_out = highlight_slam_features(img_out, feat_uvs, slam_feat_ids)
 
+        # FlowDep grid plane mask overlay (transparent, normal-coloured)
+        if grid_feat2plane and grid_cols > 0 and grid_stride > 0:
+            img_out = self._overlay_grid_mask(
+                img_out, grid_feat2plane, grid_feat_norms,
+                grid_cols, grid_stride, grid_image_scale,
+            )
+
         # Mode indicator
         mode_labels = {0: "GIFT", 1: "Planes", 2: "Full Diag"}
         label = mode_labels.get(self.mode, "?")
@@ -174,6 +186,47 @@ class CameraDebugWindow:
     # ------------------------------------------------------------------
     # Internal: GIFT-style feature drawing (mode 0)
     # ------------------------------------------------------------------
+
+    # ------------------------------------------------------------------
+    # Internal: FlowDep grid plane mask overlay
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _overlay_grid_mask(
+        img_out: np.ndarray,
+        grid_feat2plane: dict[int, int],
+        grid_feat_norms: Optional[dict[int, list]],
+        grid_cols: int,
+        grid_stride: int,
+        image_scale: float,
+        alpha: float = 0.3,
+    ) -> np.ndarray:
+        """Blend FlowDep grid plane mask onto the camera image, coloured by surface normal."""
+        from .plane_visualiser import _normal_to_rgb
+
+        h, w = img_out.shape[:2]
+        overlay = img_out.copy()
+        inv_scale = 1.0 / image_scale if image_scale > 0 else 1.0
+
+        for cell_id, plane_id in grid_feat2plane.items():
+            row = cell_id // grid_cols
+            col = cell_id % grid_cols
+            y0 = int(row * grid_stride * inv_scale)
+            x0 = int(col * grid_stride * inv_scale)
+            y1 = min(int((row + 1) * grid_stride * inv_scale), h)
+            x1 = min(int((col + 1) * grid_stride * inv_scale), w)
+
+            # Colour by averaged feature normal
+            colour = (128, 128, 128)  # fallback grey
+            if grid_feat_norms and cell_id in grid_feat_norms:
+                norms = grid_feat_norms[cell_id]
+                if norms:
+                    avg_n = np.mean(norms, axis=0)
+                    colour = _normal_to_rgb(avg_n)
+            overlay[y0:y1, x0:x1] = colour
+
+        cv2.addWeighted(overlay, alpha, img_out, 1 - alpha, 0, img_out)
+        return img_out
 
     @staticmethod
     def _draw_gift_features(img: np.ndarray, features) -> np.ndarray:

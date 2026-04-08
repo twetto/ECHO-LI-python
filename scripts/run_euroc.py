@@ -97,6 +97,8 @@ def main():
     parser.add_argument("--gt-init", action="store_true",
                         help="Initialize from ground truth pose (for debugging)")
     parser.add_argument("--max-features", type=int, default=40)
+    parser.add_argument("--flowdep", action="store_true",
+                        help="Enable FlowDep dense depth filter (Phase c)")
     args = parser.parse_args()
 
     # ------------------------------------------------------------------
@@ -254,6 +256,61 @@ def main():
             max_norm_deg=180))
         print("Plane detection enabled")
 
+    # Initialize FlowDep dense depth filter
+    flowdep_filter = None
+    flowdep_plane_detector = None
+    if args.flowdep:
+        from eqvio.flowdep import FlowDepFilter, FlowDepSettings, relabel_landmarks_by_grid
+        flowdep_cfg = config.get('FlowDep', {})
+        _dis_presets = {
+            'ultrafast': cv2.DISOpticalFlow_PRESET_ULTRAFAST,
+            'fast': cv2.DISOpticalFlow_PRESET_FAST,
+            'medium': cv2.DISOpticalFlow_PRESET_MEDIUM,
+        }
+        flowdep_settings = FlowDepSettings(
+            image_scale=flowdep_cfg.get('image_scale', 1.0),
+            enable_warmstart=flowdep_cfg.get('enable_warmstart', True),
+            dis_preset=_dis_presets.get(flowdep_cfg.get('dis_preset', 'medium'),
+                                        cv2.DISOpticalFlow_PRESET_MEDIUM),
+            dis_finest_scale=flowdep_cfg.get('dis_finest_scale', -1),
+            grid_stride=flowdep_cfg.get('grid_stride', 8),
+            grid_var_threshold=flowdep_cfg.get('grid_var_threshold', 0.1),
+            keyframe_flow_threshold=flowdep_cfg.get('keyframe_flow_threshold', 3.0),
+            max_keyframes=flowdep_cfg.get('max_keyframes', 5),
+            texture_mask=flowdep_cfg.get('texture_mask', False),
+            texture_threshold=flowdep_cfg.get('texture_threshold', 5),
+            process_invdepth_var=flowdep_cfg.get('process_invdepth_var', 0.1),
+        )
+        # Precompute undistortion maps (FlowDep assumes pinhole model)
+        K_raw = camera.K_matrix()
+        dist_coeffs = np.array(getattr(camera, 'dist', [0.0, 0.0, 0.0, 0.0]), dtype=np.float64)
+        w_cam, h_cam = camera.image_size
+        K_undist, _ = cv2.getOptimalNewCameraMatrix(K_raw, dist_coeffs, (w_cam, h_cam), 0)
+        flowdep_mapx, flowdep_mapy = cv2.initUndistortRectifyMap(
+            K_raw, dist_coeffs, None, K_undist, (w_cam, h_cam), cv2.CV_32FC1,
+        )
+        K_flowdep = K_undist
+        flowdep_filter = FlowDepFilter(K_flowdep, flowdep_settings)
+        # Separate PlaneDetector instance for grid mesh plane detection
+        grid_stride = flowdep_settings.grid_stride
+        flowdep_plane_detector = PlaneDetector(PlaneDetectorSettings(
+            max_tri_side_px=int(1.5 * grid_stride),
+            max_pairwise_px=int(2.5 * grid_stride),
+            max_dist_between_z=0.15,
+            max_norm_deg=25,
+            min_plane_features=3,
+        ))
+        print(f"FlowDep enabled (scale={flowdep_settings.image_scale}, "
+              f"{int(w_cam * flowdep_settings.image_scale)}x{int(h_cam * flowdep_settings.image_scale)}, "
+              f"grid_stride={grid_stride})")
+
+    # FlowDep debug window
+    flowdep_debug = None
+    if args.flowdep and args.display:
+        from eqvio.flowdep_visualiser import FlowDepDebugWindow
+        flowdep_debug = FlowDepDebugWindow(enabled=True)
+        print("FlowDep debug window enabled (press 'd' depth/var, 'q' quit)")
+
     timestamps_out = []
     from eqvio.loop_timer import LoopTimer
     timer = LoopTimer()
@@ -312,9 +369,9 @@ def main():
             # Capture the predicted state before the vision update for visualization
             predicted_state = vio_filter.state_estimate()
 
-            # Vision update
+            # Vision update (pass FlowDep for landmark depth warm-start)
             timer.start("vision_update")
-            vio_filter.process_vision(meas, camera)
+            vio_filter.process_vision(meas, camera, flowdep=flowdep_filter)
             timer.stop("vision_update")
             vision_count += 1
 
@@ -323,6 +380,15 @@ def main():
             timestamps_out.append(vio_filter.get_time())
             states_out.append(state)
 
+            # FlowDep: feed EqF camera pose + grayscale image
+            if flowdep_filter is not None:
+                timer.start("flowdep")
+                # T_WC via SE3 composition: T_{G←C} = T_{G←I} * T_{I←C}
+                T_WC = (state.sensor.pose * state.sensor.camera_offset).asMatrix()
+                image_undist = cv2.remap(image, flowdep_mapx, flowdep_mapy, cv2.INTER_LINEAR)
+                flowdep_filter.process_frame(image_undist, T_WC, stamp)
+                timer.stop("flowdep")
+
             # Live trajectory plot
             if visualiser is not None:
                 #visualiser.update(vio_filter.get_time(), state)
@@ -330,9 +396,55 @@ def main():
 
             # Plane detection + fitting
             feat2plane = {}
+            grid_feat2plane = {}
             tri_data = None
             plane_cps = {}
-            if plane_detector is not None:
+            feat_pos = {}
+            cam_pos = None
+            R_GtoC = None
+
+            # FlowDep mesh plane detection: grid pseudo-features → PlaneDetector
+            # → relabel EqVIO landmarks → fit CP on EqVIO landmarks
+            if flowdep_plane_detector is not None and flowdep_filter is not None and flowdep_filter.invdepth_state is not None:
+                timer.start("plane_detect")
+                # Get grid pseudo-features in world frame
+                grid_uvs, grid_pos = flowdep_filter.grid_features_global(T_WC)
+                if len(grid_pos) >= 3:
+                    if cam_pos is None:
+                        feat_pos, cam_pos, R_GtoC = landmarks_to_global(state)
+                    flowdep_plane_detector.update(grid_uvs, grid_pos, cam_pos, R_GtoC)
+                    grid_feat2plane = flowdep_plane_detector.feat2plane
+
+                    if grid_feat2plane:
+                        # Relabel EqVIO landmarks by grid cell plane IDs
+                        eqvio_uvs = {
+                            f.id_number: (float(f.cam_coordinates[0]),
+                                          float(f.cam_coordinates[1]))
+                            for f in features
+                        }
+                        H_img, W_img = flowdep_filter.invdepth_state.shape
+                        grid_cols = W_img // flowdep_settings.grid_stride
+                        feat2plane = relabel_landmarks_by_grid(
+                            eqvio_uvs, grid_feat2plane,
+                            grid_cols, flowdep_settings.grid_stride,
+                            image_scale=flowdep_settings.image_scale,
+                        )
+                timer.stop("plane_detect")
+
+                # Fit CP using EqVIO landmark 3D positions
+                if feat2plane:
+                    timer.start("plane_fit")
+                    if not feat_pos:
+                        feat_pos, cam_pos, R_GtoC = landmarks_to_global(state)
+                    plane_cps, plane_inliers = fit_detected_planes(feat2plane, feat_pos)
+                    timer.stop("plane_fit")
+
+                if plane_cps and args.planes:
+                    timer.start("plane_augment")
+                    vio_filter.augment_planes(plane_cps, plane_inliers)
+                    timer.stop("plane_augment")
+
+            elif plane_detector is not None:
                 timer.start("plane_detect")
                 # Build feature pixel positions
                 feat_uvs = {
@@ -341,7 +453,8 @@ def main():
                     for f in features
                 }
                 # Get 3D landmarks in global frame
-                feat_pos, cam_pos, R_GtoC = landmarks_to_global(state)
+                if not feat_pos:
+                    feat_pos, cam_pos, R_GtoC = landmarks_to_global(state)
                 plane_detector.update(feat_uvs, feat_pos, cam_pos, R_GtoC)
                 feat2plane = plane_detector.feat2plane
                 tri_data = plane_detector.delaunay_data
@@ -369,14 +482,31 @@ def main():
                         tri_feat_ids=tri_data[1],
                         tri_normals=tri_data[2],
                     )
+                fd_gcols_cam = 0
+                if flowdep_filter is not None and flowdep_filter.invdepth_state is not None:
+                    fd_gcols_cam = flowdep_filter.invdepth_state.shape[1] // flowdep_settings.grid_stride
                 cam_debug.update(
                     image,
                     features=features,
                     feat2plane=feat2plane,
                     slam_feat_ids=slam_ids,
+                    grid_feat2plane=grid_feat2plane,
+                    grid_feat_norms=flowdep_plane_detector._feat_norms if flowdep_plane_detector is not None else None,
+                    grid_cols=fd_gcols_cam,
+                    grid_stride=flowdep_settings.grid_stride if flowdep_filter is not None else 8,
+                    grid_image_scale=flowdep_settings.image_scale if flowdep_filter is not None else 1.0,
                     **tri_kw,
                 )
                 if not cam_debug.enabled:   # user pressed 'q'
+                    break
+
+            # FlowDep debug window
+            if flowdep_debug is not None and flowdep_filter is not None:
+                flowdep_debug.update(
+                    flowdep_filter.invdepth_state,
+                    flowdep_filter.invdepth_var,
+                )
+                if not flowdep_debug.enabled:
                     break
 
             # Progress
@@ -456,6 +586,8 @@ def main():
 
     if cam_debug is not None:
         cam_debug.close()
+    if flowdep_debug is not None:
+        flowdep_debug.close()
 
     if visualiser is not None:
         visualiser.finish()

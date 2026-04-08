@@ -367,7 +367,7 @@ class VIOFilter:
     # Vision processing
     # -------------------------------------------------------------------
 
-    def process_vision(self, measurement: VisionMeasurement, camera):
+    def process_vision(self, measurement: VisionMeasurement, camera, flowdep=None):
         """Process a vision measurement: manage features, then Kalman update.
 
         Reference: VIOFilter::processVisionData()
@@ -375,6 +375,7 @@ class VIOFilter:
         Args:
             measurement: VisionMeasurement with tracked features
             camera:      GIFT camera model
+            flowdep:     Optional FlowDepFilter for warm-starting landmark depth
         """
         if self.eqf.current_time < 0:
             return
@@ -418,18 +419,57 @@ class VIOFilter:
         if new_ids:
             xi_hat = self.eqf.state_estimate()
             new_landmarks = []
+            new_variances = []
             for fid in new_ids:
                 if len(self.eqf.X.id) + len(new_landmarks) >= self.settings.max_landmarks:
                     break
                 pixel = measurement.cam_coordinates[fid]
                 bearing = camera.undistort_point(pixel)
-                # Initialize at configured scene depth
-                p = bearing * self.settings.initial_scene_depth
+
+                # Try FlowDep warm-start; fall back to configured scene depth
+                depth = self.settings.initial_scene_depth
+                point_cov_3x3 = np.eye(3) * self.settings.initial_point_variance
+                if flowdep is not None:
+                    fd_inv_d, fd_inv_var = flowdep.query(pixel[0], pixel[1])
+                    if fd_inv_d > 0:
+                        fd_depth = 1.0 / fd_inv_d
+                        # Use FlowDep depth but keep default initial variance
+                        depth = fd_depth
+                        # if self.settings.coordinate_choice == "InvDepth":
+                        #     # InvDepth chart: [bearing_stereo(2), inv_depth(1)]
+                        #     # FlowDep var(1/z) maps directly to slot 3;
+                        #     # bearing slots keep default variance.
+                        #     if fd_inv_var < self.settings.initial_point_variance:
+                        #         depth = fd_depth
+                        #         point_cov_3x3 = np.diag([
+                        #             self.settings.initial_point_variance,
+                        #             self.settings.initial_point_variance,
+                        #             fd_inv_var,
+                        #         ])
+                        # else:
+                        #     # Euclidean chart: [dx, dy, dz]
+                        #     # var(z) = z^4 * var(1/z), applied along bearing.
+                        #     fd_depth_var = (fd_depth ** 4) * fd_inv_var
+                        #     if fd_depth_var < self.settings.initial_point_variance:
+                        #         depth = fd_depth
+                        #         # Rank-1 depth uncertainty along ray +
+                        #         # default tangential variance
+                        #         b = bearing / np.linalg.norm(bearing)
+                        #         point_cov_3x3 = (
+                        #             self.settings.initial_point_variance * np.eye(3)
+                        #             + (fd_depth_var - self.settings.initial_point_variance)
+                        #             * np.outer(b, b)
+                        #         )
+
+                p = bearing * depth
                 new_landmarks.append(Landmark(p=p, id=fid))
+                new_variances.append(point_cov_3x3)
 
             if new_landmarks:
                 n_new = len(new_landmarks)
-                new_cov = np.eye(3 * n_new) * self.settings.initial_point_variance
+                new_cov = np.zeros((3 * n_new, 3 * n_new))
+                for i, cov_3x3 in enumerate(new_variances):
+                    new_cov[3*i:3*(i+1), 3*i:3*(i+1)] = cov_3x3
                 self.eqf.add_new_landmarks(new_landmarks, new_cov)
                 self._invalidate_gain_cache()
 
