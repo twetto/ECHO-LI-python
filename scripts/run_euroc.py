@@ -386,7 +386,8 @@ def main():
                 # T_WC via SE3 composition: T_{G←C} = T_{G←I} * T_{I←C}
                 T_WC = (state.sensor.pose * state.sensor.camera_offset).asMatrix()
                 image_undist = cv2.remap(image, flowdep_mapx, flowdep_mapy, cv2.INTER_LINEAR)
-                flowdep_filter.process_frame(image_undist, T_WC, stamp)
+                P_vv = vio_filter.get_velocity_cov()
+                flowdep_filter.process_frame(image_undist, T_WC, stamp, P_vv=P_vv)
                 timer.stop("flowdep")
 
             # Live trajectory plot

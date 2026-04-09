@@ -342,6 +342,7 @@ class FlowDepFilter:
         curr_gray: np.ndarray,
         T_WC_curr: np.ndarray,
         stamp: float,
+        P_vv: np.ndarray | None = None,
     ) -> bool:
         """Run one FlowDep cycle: predict (warp) + observe (triangulate) + update.
 
@@ -349,6 +350,7 @@ class FlowDepFilter:
             curr_gray: current grayscale image (H, W) uint8
             T_WC_curr: (4,4) camera-to-world SE3 from EqF
             stamp: timestamp
+            P_vv: (3,3) velocity covariance from EqF Riccati, or None for fixed process noise
 
         Returns:
             True if depth map was updated this frame.
@@ -432,7 +434,7 @@ class FlowDepFilter:
             observed_invdepth[:, -b:] = -1.0
 
         # --- Predict: warp previous state to current frame ---
-        predicted_invdepth, predicted_var = self._predict(T_WC_curr)
+        predicted_invdepth, predicted_var = self._predict(T_WC_curr, P_vv)
 
         if predicted_invdepth is None:
             # First observation — initialize directly from triangulation
@@ -461,7 +463,7 @@ class FlowDepFilter:
 
         return True
 
-    def _predict(self, T_WC_curr: np.ndarray):
+    def _predict(self, T_WC_curr: np.ndarray, P_vv: np.ndarray | None = None):
         """Propagate depth state from previous frame to current via 3D warping."""
         s = self.settings
 
@@ -514,7 +516,12 @@ class FlowDepFilter:
             + z_axis_new_in_old[2]
         )
         J_squared = ((Z_old / Z_new) ** 4) * (geometric_factor**2)
-        propagated_var = (J_squared * var_old + s.process_invdepth_var).astype(
+        # Process noise: use velocity covariance from EqF Riccati if available
+        if P_vv is not None:
+            process_var = np.trace(P_vv)
+        else:
+            process_var = s.process_invdepth_var
+        propagated_var = (J_squared * var_old + process_var).astype(
             np.float32
         )
 

@@ -352,6 +352,10 @@ class VIO_eqf:
     # Covariance queries
     # -----------------------------------------------------------------------
 
+    def get_velocity_cov(self) -> np.ndarray:
+        """Get 3x3 marginal covariance for the velocity state."""
+        return self.Sigma[12:15, 12:15].copy()
+
     def get_landmark_cov_by_id(self, lm_id: int) -> np.ndarray:
         """Get 3x3 marginal covariance for a point landmark.
 

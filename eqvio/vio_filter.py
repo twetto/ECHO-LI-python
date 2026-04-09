@@ -329,6 +329,10 @@ class VIOFilter:
     def state_estimate(self) -> VIOState:
         return self.eqf.state_estimate()
 
+    def get_velocity_cov(self) -> np.ndarray:
+        """Get 3x3 velocity covariance from the Riccati matrix."""
+        return self.eqf.get_velocity_cov()
+
     # -------------------------------------------------------------------
     # IMU processing
     # -------------------------------------------------------------------
