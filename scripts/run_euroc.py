@@ -269,6 +269,7 @@ def main():
         }
         flowdep_settings = FlowDepSettings(
             image_scale=flowdep_cfg.get('image_scale', 1.0),
+            flow_scale=flowdep_cfg.get('flow_scale', 0.0),
             enable_warmstart=flowdep_cfg.get('enable_warmstart', True),
             dis_preset=_dis_presets.get(flowdep_cfg.get('dis_preset', 'medium'),
                                         cv2.DISOpticalFlow_PRESET_MEDIUM),
@@ -280,6 +281,13 @@ def main():
             texture_mask=flowdep_cfg.get('texture_mask', False),
             texture_threshold=flowdep_cfg.get('texture_threshold', 5),
             process_invdepth_var=flowdep_cfg.get('process_invdepth_var', 0.1),
+            uniform_rho_max=flowdep_cfg.get('uniform_rho_max', 1.0),
+            a_init=flowdep_cfg.get('a_init', 10.0),
+            b_init=flowdep_cfg.get('b_init', 2.0),
+            ab_min=flowdep_cfg.get('ab_min', 1.0),
+            ab_max=flowdep_cfg.get('ab_max', 500.0),
+            min_inlier_ratio=flowdep_cfg.get('min_inlier_ratio', 0.5),
+            mahalanobis_reset_chi2=flowdep_cfg.get('mahalanobis_reset_chi2', 9.0),
         )
         # Precompute undistortion maps (FlowDep assumes pinhole model)
         K_raw = camera.K_matrix()
@@ -300,8 +308,11 @@ def main():
             max_norm_deg=25,
             min_plane_features=3,
         ))
-        print(f"FlowDep enabled (scale={flowdep_settings.image_scale}, "
+        _fs = flowdep_settings.flow_scale if flowdep_settings.flow_scale > 0 else flowdep_settings.image_scale
+        print(f"FlowDep enabled (state_scale={flowdep_settings.image_scale}, "
               f"{int(w_cam * flowdep_settings.image_scale)}x{int(h_cam * flowdep_settings.image_scale)}, "
+              f"flow_scale={_fs}, "
+              f"{int(w_cam * _fs)}x{int(h_cam * _fs)}, "
               f"grid_stride={grid_stride})")
 
     # FlowDep debug window
@@ -388,6 +399,7 @@ def main():
                 image_undist = cv2.remap(image, flowdep_mapx, flowdep_mapy, cv2.INTER_LINEAR)
                 P_vv = vio_filter.get_velocity_cov()
                 flowdep_filter.process_frame(image_undist, T_WC, stamp, P_vv=P_vv)
+                # flowdep_filter.process_frame(image_undist, T_WC, stamp)
                 timer.stop("flowdep")
 
             # Live trajectory plot
@@ -506,6 +518,9 @@ def main():
                 flowdep_debug.update(
                     flowdep_filter.invdepth_state,
                     flowdep_filter.invdepth_var,
+                    a_state=flowdep_filter.a_state,
+                    b_state=flowdep_filter.b_state,
+                    min_inlier_ratio=flowdep_settings.min_inlier_ratio,
                 )
                 if not flowdep_debug.enabled:
                     break

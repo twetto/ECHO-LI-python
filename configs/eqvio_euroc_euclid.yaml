@@ -48,7 +48,7 @@ eqf:
     useDiscreteInnovationLift: false
     useDiscreteVelocityLift: true
     useEquivariantOutput: true
-    #useFeaturePredictions: true
+    # useFeaturePredictions: true
     useFeaturePredictions: false
     # useMedianDepth: false
     useMedianDepth: true
@@ -61,14 +61,24 @@ main:
   writeState: true
   cameraLag: 0.00
 FlowDep:
-  image_scale: 0.25
+  image_scale: 0.25     # state grid scale
+  flow_scale: 0.25      # DIS flow scale (0 = same as image_scale)
   enable_warmstart: true
   dis_preset: ultrafast
   dis_finest_scale: 0
   grid_stride: 8
-  texture_mask: true
-  texture_threshold: 20
+  # texture_mask: true
+  texture_mask: false
+  # texture_threshold: 20
   keyframe_flow_threshold: 0.0
-  max_keyframes: 2
+  max_keyframes: 1
   grid_var_threshold: 0.1
   process_invdepth_var: 0.1
+  # Vogiatzis Gaussian-Beta mixture update (SVO-style)
+  uniform_rho_max: 1.0       # 1/Z_min density upper bound
+  a_init: 10.0               # inlier prior (Beta shape)
+  b_init: 2.0                # outlier prior — asymmetric from DIS noise study
+  ab_min: 1.0
+  ab_max: 20.0
+  min_inlier_ratio: 0.5      # gate query() landmark init
+  mahalanobis_reset_chi2: 9.0  # reset stuck outlier pixels when obs disagrees (<=0 disables)
