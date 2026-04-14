@@ -266,14 +266,26 @@ def main():
     flowdep_filter = None
     flowdep_plane_detector = None
     if args.flowdep:
-        from eqvio.flowdep import FlowDepFilter, FlowDepSettings, relabel_landmarks_by_grid
+        from eqvio.flowdep import FlowDepFilter, FlowDepSettings, LandmarkChart, relabel_landmarks_by_grid
         flowdep_cfg = config.get('FlowDep', {})
+        _chart_types = {
+            'invdepth': LandmarkChart.INVDEPTH,
+            'euclidean': LandmarkChart.EUCLIDEAN,
+            'polar': LandmarkChart.POLAR,
+        }
         _dis_presets = {
             'ultrafast': cv2.DISOpticalFlow_PRESET_ULTRAFAST,
             'fast': cv2.DISOpticalFlow_PRESET_FAST,
             'medium': cv2.DISOpticalFlow_PRESET_MEDIUM,
         }
         flowdep_settings = FlowDepSettings(
+            chart_type=_chart_types.get(
+                flowdep_cfg.get('chart_type', 'invdepth'),
+                LandmarkChart.INVDEPTH,
+            ),
+            init_depth_var=flowdep_cfg.get('init_depth_var', 1.0),
+            init_invdepth_var=flowdep_cfg.get('init_invdepth_var', 1.0),
+            init_logdepth_var=flowdep_cfg.get('init_logdepth_var', 0.1),
             image_scale=flowdep_cfg.get('image_scale', 1.0),
             flow_scale=flowdep_cfg.get('flow_scale', 0.0),
             enable_warmstart=flowdep_cfg.get('enable_warmstart', True),

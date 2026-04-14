@@ -30,12 +30,27 @@ import numpy as np
 # Settings
 # ============================================================================
 
+from enum import Enum
+
+
+class LandmarkChart(Enum):
+    """Landmark parametrization for FlowDep."""
+    EUCLIDEAN = "euclidean"
+    INVDEPTH = "invdepth"
+    POLAR = "polar"
+
+
 @dataclass
 class FlowDepSettings:
     """Configuration for the FlowDep dense depth filter."""
 
-    # --- Inverse-depth filter ---
-    init_invdepth_var: float = 1.0
+    # --- Landmark parametrization ---
+    chart_type: LandmarkChart = LandmarkChart.INVDEPTH
+
+    # --- Initial variances (per chart) ---
+    init_depth_var: float = 1.0      # Euclidean: var(z)
+    init_invdepth_var: float = 1.0    # InvDepth: var(rho)
+    init_logdepth_var: float = 0.1    # Polar: var(log(z))
     process_invdepth_var: float = 1e-1
     propagate_crit_var: float = 3.0
     max_inv_depth: float = 100.0
@@ -131,7 +146,8 @@ def _depth_densification(K, dR, p, flow):
             ideal_mag = np.sqrt(geom_mag_sq)
             obs_mag = np.sqrt(den_x**2 + den_y**2)
 
-            if ideal_mag > 1e-2 and obs_mag > 1e-6:
+            # if ideal_mag > 1e-2 and obs_mag > 1e-6:
+            if ideal_mag > 0 and obs_mag > 0:
                 geom_drive_map[v, u] = ideal_mag
                 dot_product = num_x * den_x + num_y * den_y
                 cosine_sim = dot_product / (ideal_mag * obs_mag)
@@ -464,9 +480,13 @@ class FlowDepFilter:
         self.K = K_scaled
         self._sigma_norm = self.settings.sigma_pixel / self.K[0, 0]
 
-        # Dense state
-        self.invdepth_state: Optional[np.ndarray] = None
+        # Dense state per chart
+        self.depth_state: Optional[np.ndarray] = None      # Euclidean: z
+        self.depth_var: Optional[np.ndarray] = None
+        self.invdepth_state: Optional[np.ndarray] = None   # InvDepth: rho = 1/z
         self.invdepth_var: Optional[np.ndarray] = None
+        self.logdepth_state: Optional[np.ndarray] = None  # Polar: d = log(z)
+        self.logdepth_var: Optional[np.ndarray] = None
         # Vogiatzis Beta parameters (inlier / outlier counts)
         self.a_state: Optional[np.ndarray] = None
         self.b_state: Optional[np.ndarray] = None
@@ -482,8 +502,12 @@ class FlowDepFilter:
 
     def reset(self):
         """Reset all state."""
+        self.depth_state = None
+        self.depth_var = None
         self.invdepth_state = None
         self.invdepth_var = None
+        self.logdepth_state = None
+        self.logdepth_var = None
         self.a_state = None
         self.b_state = None
         self._prev_gray = None
@@ -618,15 +642,8 @@ class FlowDepFilter:
         )
 
         if predicted_invdepth is None:
-            # First observation — initialize directly from triangulation
-            self.invdepth_state = observed_invdepth.copy()
-            self.invdepth_var = np.where(
-                observed_invdepth > 0,
-                (self._sigma_norm / np.maximum(geom_drive_map, 1e-8)) ** 2,
-                s.init_invdepth_var,
-            ).astype(np.float32)
-            self.a_state = np.full_like(observed_invdepth, s.a_init, dtype=np.float32)
-            self.b_state = np.full_like(observed_invdepth, s.b_init, dtype=np.float32)
+            # First observation — initialize all chart states from triangulation
+            self._init_all_states_from_invdepth(observed_invdepth, geom_drive_map)
         else:
             # --- Update: Vogiatzis Gaussian-Beta mixture fusion ---
             updated_invdepth, updated_var, updated_a, updated_b = _vogiatzis_update(
@@ -637,8 +654,7 @@ class FlowDepFilter:
                 s.min_inlier_ratio, s.mahalanobis_reset_chi2,
             )
             updated_invdepth[updated_invdepth > s.max_inv_depth] = -1.0
-            self.invdepth_state = updated_invdepth
-            self.invdepth_var = updated_var
+            self._update_all_states_from_invdepth(updated_invdepth, updated_var)
             self.a_state = updated_a
             self.b_state = updated_b
 
@@ -769,6 +785,100 @@ class FlowDepFilter:
 
         return predicted_invdepth, predicted_var, predicted_a, predicted_b
 
+    # ------------------------------------------------------------------
+    # Chart conversion helpers (InvDepth is canonical internal state)
+    # ------------------------------------------------------------------
+
+    def _invdepth_to_depth(self, inv_depth: np.ndarray) -> np.ndarray:
+        """Convert invdepth to euclidean depth."""
+        with np.errstate(divide='ignore', invalid='ignore'):
+            depth = np.where(inv_depth > 0, 1.0 / inv_depth, -1.0)
+        return depth.astype(np.float32)
+
+    def _depth_to_invdepth(self, depth: np.ndarray) -> np.ndarray:
+        """Convert euclidean depth to invdepth."""
+        with np.errstate(divide='ignore', invalid='ignore'):
+            inv_d = np.where(depth > 0, 1.0 / depth, -1.0)
+        return inv_d.astype(np.float32)
+
+    def _invdepth_var_to_depth_var(
+        self, inv_depth: np.ndarray, inv_var: np.ndarray
+    ) -> np.ndarray:
+        """Transform invdepth variance to depth variance."""
+        with np.errstate(divide='ignore', invalid='ignore'):
+            depth = np.where(inv_depth > 0, 1.0 / inv_depth, 1.0)
+            var_z = np.where(
+                inv_depth > 0,
+                (depth ** 4) * inv_var,
+                1e6
+            )
+        return var_z.astype(np.float32)
+
+    def _invdepth_to_logdepth(self, inv_depth: np.ndarray) -> np.ndarray:
+        """Convert invdepth to polar logdepth."""
+        with np.errstate(divide='ignore', invalid='ignore'):
+            log_d = np.where(inv_depth > 0, np.log(1.0 / inv_depth), -1.0)
+        return log_d.astype(np.float32)
+
+    def _logdepth_to_invdepth(self, log_depth: np.ndarray) -> np.ndarray:
+        """Convert polar logdepth to invdepth."""
+        with np.errstate(divide='ignore', invalid='ignore'):
+            inv_d = np.where(log_depth >= 0, np.exp(-log_depth), -1.0)
+        return inv_d.astype(np.float32)
+
+    def _invdepth_var_to_logdepth_var(
+        self, inv_depth: np.ndarray, inv_var: np.ndarray
+    ) -> np.ndarray:
+        """Transform invdepth variance to logdepth variance."""
+        with np.errstate(divide='ignore', invalid='ignore'):
+            depth = np.where(inv_depth > 0, 1.0 / inv_depth, 1.0)
+            var_log = np.where(
+                inv_depth > 0,
+                (depth ** 2) * inv_var,
+                1e6
+            )
+        return var_log.astype(np.float32)
+
+    def _init_all_states_from_invdepth(
+        self,
+        inv_depth_map: np.ndarray,
+        geom_drive: np.ndarray,
+    ):
+        """Initialize all chart states from invdepth."""
+        s = self.settings
+        valid_mask = inv_depth_map > 0
+        obs_var_inv = (self._sigma_norm / np.maximum(geom_drive, 1e-8)) ** 2
+
+        self.invdepth_state = inv_depth_map.copy()
+        self.invdepth_var = np.where(valid_mask, obs_var_inv, s.init_invdepth_var).astype(np.float32)
+
+        self.depth_state = self._invdepth_to_depth(inv_depth_map)
+        self.depth_var = self._invdepth_var_to_depth_var(inv_depth_map, self.invdepth_var)
+        self.depth_var = np.where(valid_mask, self.depth_var, s.init_depth_var).astype(np.float32)
+
+        self.logdepth_state = self._invdepth_to_logdepth(inv_depth_map)
+        self.logdepth_var = self._invdepth_var_to_logdepth_var(inv_depth_map, self.invdepth_var)
+        self.logdepth_var = np.where(valid_mask, self.logdepth_var, s.init_logdepth_var).astype(np.float32)
+
+        self.a_state = np.full_like(inv_depth_map, s.a_init, dtype=np.float32)
+        self.b_state = np.full_like(inv_depth_map, s.b_init, dtype=np.float32)
+
+    def _update_all_states_from_invdepth(self, updated_invdepth: np.ndarray, updated_var: np.ndarray):
+        """Update all chart states from updated invdepth state."""
+        s = self.settings
+        valid_mask = updated_invdepth > 0
+
+        self.invdepth_state = updated_invdepth.copy()
+        self.invdepth_var = updated_var.copy()
+
+        self.depth_state = self._invdepth_to_depth(updated_invdepth)
+        self.depth_var = self._invdepth_var_to_depth_var(updated_invdepth, updated_var)
+        self.depth_var = np.where(valid_mask, self.depth_var, s.init_depth_var).astype(np.float32)
+
+        self.logdepth_state = self._invdepth_to_logdepth(updated_invdepth)
+        self.logdepth_var = self._invdepth_var_to_logdepth_var(updated_invdepth, updated_var)
+        self.logdepth_var = np.where(valid_mask, self.logdepth_var, s.init_logdepth_var).astype(np.float32)
+
     def _median_depth(self) -> float:
         """Median depth from current state, for keyframe baseline threshold."""
         if self.invdepth_state is None:
@@ -783,10 +893,14 @@ class FlowDepFilter:
     # ------------------------------------------------------------------
 
     def query(self, u: float, v: float) -> tuple[float, float]:
-        """Query inverse depth and variance at a pixel (full-res coords).
+        """Query depth in the configured chart and its variance (full-res coords).
 
         Returns:
-            (inv_depth, variance) or (-1.0, inf) if invalid/disabled.
+            (state_value, variance) or (-1.0, inf) if invalid/disabled.
+            Value depends on chart_type:
+                INVDEPTH: (inv_depth, var)
+                EUCLIDEAN: (depth, var)
+                POLAR: (log_depth, var)
         """
         if not self.settings.enable_warmstart:
             return -1.0, float("inf")
@@ -796,11 +910,45 @@ class FlowDepFilter:
         h, w = self.invdepth_state.shape
         if not (0 <= vi < h and 0 <= ui < w):
             return -1.0, float("inf")
+
+        a = self.a_state[vi, ui]
+        b = self.b_state[vi, ui]
+        if a + b <= 0 or a / (a + b) < self.settings.min_inlier_ratio:
+            return -1.0, float("inf")
+
+        chart = self.settings.chart_type
+        if chart == LandmarkChart.INVDEPTH:
+            val = self.invdepth_state[vi, ui]
+            var = self.invdepth_var[vi, ui]
+        elif chart == LandmarkChart.EUCLIDEAN:
+            val = self.depth_state[vi, ui]
+            var = self.depth_var[vi, ui]
+        elif chart == LandmarkChart.POLAR:
+            val = self.logdepth_state[vi, ui]
+            var = self.logdepth_var[vi, ui]
+        else:
+            return -1.0, float("inf")
+
+        if val <= 0 if chart != LandmarkChart.POLAR else val < 0:
+            return -1.0, float("inf")
+        return float(val), float(var)
+
+    def query_invdepth(self, u: float, v: float) -> tuple[float, float]:
+        """Query inverse depth and variance at a pixel (full-res coords).
+
+        Returns:
+            (inv_depth, variance) or (-1.0, inf) if invalid/disabled.
+        """
+        if not self.settings.enable_warmstart or self.invdepth_state is None:
+            return -1.0, float("inf")
+        vi, ui = int(round(v * self._scale)), int(round(u * self._scale))
+        h, w = self.invdepth_state.shape
+        if not (0 <= vi < h and 0 <= ui < w):
+            return -1.0, float("inf")
         inv_d = self.invdepth_state[vi, ui]
         var = self.invdepth_var[vi, ui]
         if inv_d <= 0:
             return -1.0, float("inf")
-        # Vogiatzis inlier-ratio gate
         a = self.a_state[vi, ui]
         b = self.b_state[vi, ui]
         if a + b <= 0 or a / (a + b) < self.settings.min_inlier_ratio:
@@ -813,11 +961,10 @@ class FlowDepFilter:
         Returns:
             (depth, depth_var) or (-1.0, inf) if invalid.
         """
-        inv_d, inv_var = self.query(u, v)
+        inv_d, inv_var = self.query_invdepth(u, v)
         if inv_d <= 0:
             return -1.0, float("inf")
         depth = 1.0 / inv_d
-        # var(z) ≈ (dz/d(1/z))^2 * var(1/z) = z^4 * var(1/z)
         depth_var = (depth**4) * inv_var
         return float(depth), float(depth_var)
 

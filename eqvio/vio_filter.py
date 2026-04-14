@@ -15,6 +15,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from typing import Optional, List, Dict
+import math
 import numpy as np
 import yaml
 
@@ -457,9 +458,14 @@ class VIOFilter:
 
                 depth = self.settings.initial_scene_depth
                 if flowdep is not None:
-                    fd_inv_d, fd_inv_var = flowdep.query(pixel[0], pixel[1])
-                    if fd_inv_d > 0:
-                        depth = 1.0 / fd_inv_d
+                    fd_val, fd_var = flowdep.query(pixel[0], pixel[1])
+                    if fd_val > 0:
+                        if flowdep.settings.chart_type.value == "invdepth":
+                            depth = 1.0 / fd_val
+                        elif flowdep.settings.chart_type.value == "euclidean":
+                            depth = fd_val
+                        elif flowdep.settings.chart_type.value == "polar":
+                            depth = math.exp(fd_val)
 
                 p = bearing * depth
                 # NOTE: initial_point_variance is interpreted directly in the

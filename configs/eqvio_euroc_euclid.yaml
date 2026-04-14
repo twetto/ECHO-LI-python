@@ -64,6 +64,8 @@ main:
 FlowDep:
   image_scale: 0.25     # state grid scale
   flow_scale: 0.25      # DIS flow scale (0 = same as image_scale)
+  # chart_type: invdepth  # landmark parametrization: invdepth, euclidean, polar
+  chart_type: polar  # landmark parametrization: invdepth, euclidean, polar
   # enable_warmstart: true
   enable_warmstart: false
   dis_preset: ultrafast
