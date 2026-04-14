@@ -382,7 +382,7 @@ def main():
 
             # Vision update (pass FlowDep for landmark depth warm-start)
             timer.start("vision_update")
-            vio_filter.process_vision(meas, camera, flowdep=flowdep_filter)
+            vio_filter.process_vision(meas, camera, flowdep=flowdep_filter, tracker=tracker)
             timer.stop("vision_update")
             vision_count += 1
 

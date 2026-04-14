@@ -371,7 +371,7 @@ class VIOFilter:
     # Vision processing
     # -------------------------------------------------------------------
 
-    def process_vision(self, measurement: VisionMeasurement, camera, flowdep=None):
+    def process_vision(self, measurement: VisionMeasurement, camera, flowdep=None, tracker=None):
         """Process a vision measurement: manage features, then Kalman update.
 
         Reference: VIOFilter::processVisionData()
@@ -380,6 +380,11 @@ class VIOFilter:
             measurement: VisionMeasurement with tracked features
             camera:      GIFT camera model
             flowdep:     Optional FlowDepFilter for warm-starting landmark depth
+            tracker:     Optional GIFT tracker. If provided, outlier-rejected
+                         features are also discarded from the tracker so it
+                         re-detects fresh corners next frame (VINS-FUSION
+                         style). Avoids latching onto edges that survive LK
+                         but drift in depth.
         """
         if self.eqf.current_time < 0:
             return
@@ -505,6 +510,12 @@ class VIOFilter:
                 except (StopIteration, KeyError):
                     pass
             self._invalidate_gain_cache()
+
+            if tracker is not None:
+                try:
+                    tracker.discard_features(outlier_ids)
+                except AttributeError:
+                    pass
 
         if not y_ids:
             return
