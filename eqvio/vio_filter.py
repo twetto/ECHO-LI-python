@@ -430,42 +430,17 @@ class VIOFilter:
                 pixel = measurement.cam_coordinates[fid]
                 bearing = camera.undistort_point(pixel)
 
-                # Try FlowDep warm-start; fall back to configured scene depth
                 depth = self.settings.initial_scene_depth
-                point_cov_3x3 = np.eye(3) * self.settings.initial_point_variance
                 if flowdep is not None:
                     fd_inv_d, fd_inv_var = flowdep.query(pixel[0], pixel[1])
                     if fd_inv_d > 0:
-                        fd_depth = 1.0 / fd_inv_d
-                        # Use FlowDep depth but keep default initial variance
-                        depth = fd_depth
-                        # if self.settings.coordinate_choice == "InvDepth":
-                        #     # InvDepth chart: [bearing_stereo(2), inv_depth(1)]
-                        #     # FlowDep var(1/z) maps directly to slot 3;
-                        #     # bearing slots keep default variance.
-                        #     if fd_inv_var < self.settings.initial_point_variance:
-                        #         depth = fd_depth
-                        #         point_cov_3x3 = np.diag([
-                        #             self.settings.initial_point_variance,
-                        #             self.settings.initial_point_variance,
-                        #             fd_inv_var,
-                        #         ])
-                        # else:
-                        #     # Euclidean chart: [dx, dy, dz]
-                        #     # var(z) = z^4 * var(1/z), applied along bearing.
-                        #     fd_depth_var = (fd_depth ** 4) * fd_inv_var
-                        #     if fd_depth_var < self.settings.initial_point_variance:
-                        #         depth = fd_depth
-                        #         # Rank-1 depth uncertainty along ray +
-                        #         # default tangential variance
-                        #         b = bearing / np.linalg.norm(bearing)
-                        #         point_cov_3x3 = (
-                        #             self.settings.initial_point_variance * np.eye(3)
-                        #             + (fd_depth_var - self.settings.initial_point_variance)
-                        #             * np.outer(b, b)
-                        #         )
+                        depth = 1.0 / fd_inv_d
 
                 p = bearing * depth
+                # NOTE: initial_point_variance is interpreted directly in the
+                # active chart's landmark slot (see docs/chart_initial_cov.md).
+                point_cov_3x3 = np.eye(3) * self.settings.initial_point_variance
+
                 new_landmarks.append(Landmark(p=p, id=fid))
                 new_variances.append(point_cov_3x3)
 
