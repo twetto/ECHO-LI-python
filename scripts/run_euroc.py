@@ -99,6 +99,9 @@ def main():
     parser.add_argument("--max-features", type=int, default=40)
     parser.add_argument("--flowdep", action="store_true",
                         help="Enable FlowDep dense depth filter (Phase c)")
+    parser.add_argument("--chart", type=str, default=None,
+                        choices=["Euclidean", "InvDepth", "Normal", "Polar"],
+                        help="Override coordinateChoice from the YAML config")
     args = parser.parse_args()
 
     # ------------------------------------------------------------------
@@ -136,6 +139,9 @@ def main():
         settings.camera_offset = reader.camera_extrinsics
 
     settings.max_landmarks = args.max_features
+
+    if args.chart is not None:
+        settings.coordinate_choice = args.chart
 
     vio_filter = VIOFilter(settings)
     print(f"Filter initialized: max_landmarks={settings.max_landmarks}, "

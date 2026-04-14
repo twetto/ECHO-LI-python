@@ -42,8 +42,9 @@ eqf:
     position: 9.981466095928483e-06
     velocity: 0.025317333863551263
   settings:
-    coordinateChoice: Euclidean
+    # coordinateChoice: Euclidean
     # coordinateChoice: InvDepth
+    coordinateChoice: Normal   # aka Polar (sphere-normal bearing + log-depth)
     fastRiccati: true
     useDiscreteInnovationLift: false
     useDiscreteVelocityLift: true
@@ -63,10 +64,11 @@ main:
 FlowDep:
   image_scale: 0.25     # state grid scale
   flow_scale: 0.25      # DIS flow scale (0 = same as image_scale)
-  enable_warmstart: true
+  # enable_warmstart: true
+  enable_warmstart: false
   dis_preset: ultrafast
   dis_finest_scale: 0
-  grid_stride: 8
+  grid_stride: 16
   # texture_mask: true
   texture_mask: false
   # texture_threshold: 20

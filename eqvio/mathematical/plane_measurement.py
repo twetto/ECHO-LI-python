@@ -123,30 +123,6 @@ def constraint_Ci_star_euclid(
 # Chart-to-Euclidean Jacobians for constraint C* transformation
 # ---------------------------------------------------------------------------
 
-def conv_polar2euc(p0: np.ndarray) -> np.ndarray:
-    """3×3 Jacobian of the Polar(SOT3)-to-Euclidean coordinate change at p0.
-
-    The polar chart maps ε = [ε₁, ε₂, ε₃] to sot(3) via injection E:
-        [ε₁, ε₂, 0, ε₃] → (rotation around x, y; scale)
-
-    At ε=0 the Euclidean perturbation is:
-        δp = -[ε₁,ε₂,0] × p₀ - ε₃ · p₀
-
-    So the Jacobian is:
-        J[:, 0] = -e₁ × p₀ = skew(p₀) @ e₁
-        J[:, 1] = -e₂ × p₀ = skew(p₀) @ e₂
-        J[:, 2] = -p₀
-
-    This gives C*_polar = C*_euc @ J, which at convergence yields:
-        C*_polar ≈ [(q×p)_x, (q×p)_y, 1]
-    with the depth-independent third column — the key property.
-    """
-    J = np.zeros((3, 3))
-    J[:, 0:2] = _skew(p0)[:, 0:2]  # first two columns of skew(p0)
-    J[:, 2] = -p0
-    return J
-
-
 def constraint_Ci_star_for_chart(
     p0: np.ndarray, Q_p: SOT3,
     q0: np.ndarray, Q_q: SOT3,
@@ -165,7 +141,7 @@ def constraint_Ci_star_for_chart(
         point_chart_jacobian: function(p0) -> (3,3) Jacobian mapping
             chart perturbation to Euclidean perturbation.
             None = Euclidean (identity transform).
-            Use conv_ind2euc for InvDepth, conv_polar2euc for Polar.
+            Use conv_ind2euc for InvDepth, conv_normal2euc for Normal/Polar.
 
     Returns:
         C_p: (1, 3) — point columns in active chart
@@ -215,7 +191,7 @@ def build_stacked_update(
             rows. If None, all plane-associated points are eligible.
         point_chart_jacobian: function(p0) -> (3,3) Jacobian mapping chart
             perturbation to Euclidean perturbation. None = Euclidean chart.
-            Use conv_ind2euc for InvDepth, conv_polar2euc for Polar/SOT(3).
+            Use conv_ind2euc for InvDepth, conv_normal2euc for Normal/Polar.
 
     Returns:
         residual:   (n_rows,) stacked innovation vector

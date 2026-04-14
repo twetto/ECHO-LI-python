@@ -49,6 +49,15 @@ from .coordinate_suite.invdepth import (
     lift_innovation_invdepth,
     lift_innovation_discrete_invdepth,
 )
+from .coordinate_suite.normal import (
+    EqFCoordinateSuite_normal,
+    state_matrix_A_normal,
+    input_matrix_B_normal,
+    state_chart_normal,
+    state_chart_inv_normal,
+    lift_innovation_normal,
+    lift_innovation_discrete_normal,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -99,7 +108,7 @@ class VIOFilterSettings:
     use_discrete_correction: bool = False
     use_equivariant_output: bool = True
     use_feature_predictions: bool = False
-    coordinate_choice: str = "Euclidean"  # "Euclidean" or "InvDepth"
+    coordinate_choice: str = "Euclidean"  # "Euclidean", "InvDepth", or "Normal" (aka "Polar")
 
     # Feature management
     max_landmarks: int = 40
@@ -276,7 +285,8 @@ class VIOFilter:
         self.settings = settings
 
         # Select coordinate suite
-        if settings.coordinate_choice.lower() in ('invdepth', 'inv_depth'):
+        choice = settings.coordinate_choice.lower()
+        if choice in ('invdepth', 'inv_depth'):
             self.suite = EqFCoordinateSuite_invdepth
             _A = state_matrix_A_invdepth
             _B = input_matrix_B_invdepth
@@ -286,6 +296,16 @@ class VIOFilter:
             # InvDepth chart: constraint C* needs conv_ind2euc
             from .coordinate_suite.invdepth import conv_ind2euc
             self._constraint_chart_jacobian = conv_ind2euc
+        elif choice in ('normal', 'polar'):
+            self.suite = EqFCoordinateSuite_normal
+            _A = state_matrix_A_normal
+            _B = input_matrix_B_normal
+            _lift = lift_innovation_normal
+            _lift_d = lift_innovation_discrete_normal
+            _chart = state_chart_normal
+            # Normal chart: constraint C* needs conv_normal2euc
+            from .coordinate_suite.normal import conv_normal2euc
+            self._constraint_chart_jacobian = conv_normal2euc
         else:
             self.suite = EqFCoordinateSuite_euclid
             _A = state_matrix_A_euclid
