@@ -2,10 +2,10 @@ GIFT:
   equaliseImageHistogram: true
   useFastFeatures: false
   #featureDist: 40.0
-  featureDist: 48.0
+  featureDist: 20.0
   featureSearchThreshold: 0.8
   maxError: 50.0
-  maxFeatures: 40
+  maxFeatures: 300  # LK tracker pool (feeds sparse_vog). EqF cap is --max-features.
   maxLevel: 3
   minHarrisQuality: 0.05
   ransacParams:
@@ -16,6 +16,7 @@ GIFT:
   trackedFeatureDist: 15.0
   winSize: 21
 eqf:
+  maxFeatures: 40           # core EqF landmark cap
   initialValue:
     sceneDepth: 3.0
   initialVariance:
@@ -70,7 +71,7 @@ FlowDep:
   enable_warmstart: false
   dis_preset: ultrafast
   dis_finest_scale: 0
-  grid_stride: 16
+  grid_stride: 8
   # texture_mask: true
   texture_mask: false
   # texture_threshold: 20
@@ -86,3 +87,28 @@ FlowDep:
   ab_max: 20.0
   min_inlier_ratio: 0.5      # gate query() landmark init
   mahalanobis_reset_chi2: 9.0  # reset stuck outlier pixels when obs disagrees (<=0 disables)
+SparseVog:
+  # Per-feature 1D Vogiatzis filter (canonical: Euclidean depth).
+  max_pool_size: 300
+  min_track_length: 5
+  conv_inlier_ratio: 0.7        # a/(a+b) gate for query()
+  conv_variance_threshold: 0.5  # var(z) gate for query()
+  init_depth_var: 1.0
+  sigma_pixel: 0.5              # pixel noise for obs tau^2 = z^4 * sigma^2 / drive^2
+  uniform_z_max: 20.0           # outlier uniform density: 1/z_max
+  a_init: 10.0
+  b_init: 2.0
+  ab_min: 1.0
+  ab_max: 20.0
+  min_inlier_ratio: 0.5         # gate for Mahalanobis stuck-outlier reset
+  mahalanobis_reset_chi2: 9.0
+  process_depth_var: 0.01       # fallback when P_vv unavailable
+  min_parallax: 1.0e-4
+  min_cos_sim: 0.95
+  min_depth: 0.1
+  max_depth: 100.0
+  # PlaneDetector (separate instance, fed by sparse_vog pool)
+  pd_max_tri_side_px: 200
+  pd_max_dist_between_z: 0.15
+  pd_max_norm_deg: 25
+  pd_min_plane_features: 4

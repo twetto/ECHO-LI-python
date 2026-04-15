@@ -52,6 +52,11 @@ class CameraDebugWindow:
         self.wait_ms = wait_ms
         self._window_created = False
         self._prev_features = None
+        # Sparse Vogiatzis depth overlay toggle ('v').
+        self._show_sparse_vog = True
+        # Fixed clip range for depth colourmap (m). Auto-adjusted if data
+        # falls outside.
+        self._sv_depth_clip = (0.5, 15.0)
 
     # ------------------------------------------------------------------
 
@@ -71,6 +76,7 @@ class CameraDebugWindow:
         grid_cols: int = 0,
         grid_stride: int = 8,
         grid_image_scale: float = 1.0,
+        sparse_vog_depths: Optional[dict[int, tuple[float, float, bool]]] = None,
     ):
         """Render one frame to the debug window.
 
@@ -136,12 +142,20 @@ class CameraDebugWindow:
                 grid_cols, grid_stride, grid_image_scale,
             )
 
+        # Sparse Vogiatzis depth overlay (rings coloured by depth)
+        if self._show_sparse_vog and sparse_vog_depths:
+            img_out = self._overlay_sparse_vog(
+                img_out, feat_uvs, sparse_vog_depths, self._sv_depth_clip,
+            )
+
         # Mode indicator
         mode_labels = {0: "GIFT", 1: "Planes", 2: "Full Diag"}
         label = mode_labels.get(self.mode, "?")
         h = img_out.shape[0]
+        sv_hint = "on" if self._show_sparse_vog else "off"
         cv2.putText(
-            img_out, f"[{self.mode}] {label}  ('m' cycle, 'q' quit)",
+            img_out,
+            f"[{self.mode}] {label}  ('m' cycle, 'v' vog:{sv_hint}, 'q' quit)",
             (10, h - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.4,
             (180, 180, 180), 1, cv2.LINE_AA,
         )
@@ -168,6 +182,8 @@ class CameraDebugWindow:
         key = cv2.waitKey(self.wait_ms) & 0xFF
         if key == ord('m'):
             self.mode = (self.mode + 1) % 3
+        elif key == ord('v'):
+            self._show_sparse_vog = not self._show_sparse_vog
         elif key == ord('q'):
             self.enabled = False
             self.close()
@@ -226,6 +242,38 @@ class CameraDebugWindow:
             overlay[y0:y1, x0:x1] = colour
 
         cv2.addWeighted(overlay, alpha, img_out, 1 - alpha, 0, img_out)
+        return img_out
+
+    @staticmethod
+    def _overlay_sparse_vog(
+        img_out: np.ndarray,
+        feat_uvs: dict[int, tuple[float, float]],
+        sparse_vog_depths: dict[int, tuple[float, float, bool]],
+        depth_clip: tuple[float, float],
+    ) -> np.ndarray:
+        """Draw sparse Vogiatzis features as rings coloured by depth.
+
+        sparse_vog_depths: {feat_id: (depth, depth_var, converged)}.
+        Filled circle when converged, open ring otherwise.
+        """
+        vmin, vmax = depth_clip
+        span = max(vmax - vmin, 1e-6)
+        for fid, (depth, _var, converged) in sparse_vog_depths.items():
+            if depth <= 0:
+                continue
+            uv = feat_uvs.get(fid)
+            if uv is None:
+                continue
+            normed = np.clip((depth - vmin) / span, 0.0, 1.0)
+            gray = np.array([[int(normed * 255)]], dtype=np.uint8)
+            bgr = cv2.applyColorMap(gray, cv2.COLORMAP_TURBO)[0, 0]
+            colour = (int(bgr[0]), int(bgr[1]), int(bgr[2]))
+            pt = (int(round(uv[0])), int(round(uv[1])))
+            if converged:
+                cv2.circle(img_out, pt, 7, colour, cv2.FILLED, cv2.LINE_AA)
+                cv2.circle(img_out, pt, 7, (0, 0, 0), 1, cv2.LINE_AA)
+            else:
+                cv2.circle(img_out, pt, 6, colour, 1, cv2.LINE_AA)
         return img_out
 
     @staticmethod

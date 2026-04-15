@@ -96,9 +96,16 @@ def main():
                         help="Run cProfile and print top functions by cumulative time")
     parser.add_argument("--gt-init", action="store_true",
                         help="Initialize from ground truth pose (for debugging)")
-    parser.add_argument("--max-features", type=int, default=40)
+    parser.add_argument("--max-features", type=int, default=None,
+                        help="Core EqF landmark cap (defaults to eqf.maxFeatures in YAML)")
+    parser.add_argument("--tracker-max-features", type=int, default=None,
+                        help="LK tracker feature pool (defaults to --max-features). "
+                             "Set higher than --max-features to feed a larger pool "
+                             "to SparseVogiatzis / PlaneDetector.")
     parser.add_argument("--flowdep", action="store_true",
                         help="Enable FlowDep dense depth filter (Phase c)")
+    parser.add_argument("--sparse-vog", action="store_true",
+                        help="Enable SparseVogiatzis filter (~300 sparse features)")
     parser.add_argument("--chart", type=str, default=None,
                         choices=["Euclidean", "InvDepth", "Normal", "Polar"],
                         help="Override coordinateChoice from the YAML config")
@@ -138,7 +145,8 @@ def main():
     if reader.camera_extrinsics is not None:
         settings.camera_offset = reader.camera_extrinsics
 
-    settings.max_landmarks = args.max_features
+    if args.max_features is not None:
+        settings.max_landmarks = args.max_features
 
     if args.chart is not None:
         settings.coordinate_choice = args.chart
@@ -176,10 +184,14 @@ def main():
             min_inliers=ransac_config.get('minInliers', 10),
         )
 
-    # Override from CLI if provided
-    if args.max_features:
-        tracker.settings.max_features = args.max_features
-        settings.max_landmarks = args.max_features
+    # Tracker pool: CLI override > GIFT.maxFeatures YAML > eqf cap fallback.
+    if args.tracker_max_features is not None:
+        tracker_cap = args.tracker_max_features
+    else:
+        tracker_cap = gift_config.get('maxFeatures', settings.max_landmarks)
+    tracker.settings.max_features = tracker_cap
+    if tracker_cap != settings.max_landmarks:
+        print(f"Tracker pool decoupled: tracker={tracker_cap}, eqf={settings.max_landmarks}")
 
     print(f"Tracker: PointFeatureTracker, max_features={tracker.settings.max_features}, "
           f"feature_dist={tracker.settings.feature_dist:.1f}")
@@ -333,6 +345,43 @@ def main():
               f"{int(w_cam * _fs)}x{int(h_cam * _fs)}, "
               f"grid_stride={grid_stride})")
 
+    # Sparse Vogiatzis filter (parallel pool for plane detection + warmstart)
+    sparse_vog_filter = None
+    sparse_vog_plane_detector = None
+    if args.sparse_vog:
+        from eqvio.sparse_vogiatzis import SparseVogiatzisFilter, SparseVogSettings
+        sv_cfg = config.get('SparseVog', {}) if args.config.exists() else {}
+        sparse_vog_settings = SparseVogSettings(
+            max_pool_size=sv_cfg.get('max_pool_size', 300),
+            min_track_length=sv_cfg.get('min_track_length', 5),
+            conv_inlier_ratio=sv_cfg.get('conv_inlier_ratio', 0.7),
+            conv_variance_threshold=sv_cfg.get('conv_variance_threshold', 0.5),
+            init_depth_var=sv_cfg.get('init_depth_var', 1.0),
+            sigma_pixel=sv_cfg.get('sigma_pixel', 0.5),
+            uniform_z_max=sv_cfg.get('uniform_z_max', 20.0),
+            a_init=sv_cfg.get('a_init', 10.0),
+            b_init=sv_cfg.get('b_init', 2.0),
+            ab_min=sv_cfg.get('ab_min', 1.0),
+            ab_max=sv_cfg.get('ab_max', 20.0),
+            min_inlier_ratio=sv_cfg.get('min_inlier_ratio', 0.5),
+            mahalanobis_reset_chi2=sv_cfg.get('mahalanobis_reset_chi2', 9.0),
+            process_depth_var=sv_cfg.get('process_depth_var', 0.01),
+            min_parallax=sv_cfg.get('min_parallax', 1e-4),
+            min_cos_sim=sv_cfg.get('min_cos_sim', 0.95),
+            min_depth=sv_cfg.get('min_depth', 0.1),
+            max_depth=sv_cfg.get('max_depth', 100.0),
+        )
+        sparse_vog_filter = SparseVogiatzisFilter(camera.K_matrix(), sparse_vog_settings)
+        sparse_vog_plane_detector = PlaneDetector(PlaneDetectorSettings(
+            max_tri_side_px=sv_cfg.get('pd_max_tri_side_px', 200),
+            max_dist_between_z=sv_cfg.get('pd_max_dist_between_z', 0.15),
+            max_norm_deg=sv_cfg.get('pd_max_norm_deg', 25),
+            min_plane_features=sv_cfg.get('pd_min_plane_features', 4),
+        ))
+        print(f"SparseVog enabled (max_pool={sparse_vog_settings.max_pool_size}, "
+              f"min_track={sparse_vog_settings.min_track_length}, "
+              f"conv_ratio={sparse_vog_settings.conv_inlier_ratio})")
+
     # FlowDep debug window
     flowdep_debug = None
     if args.flowdep and args.display:
@@ -398,9 +447,14 @@ def main():
             # Capture the predicted state before the vision update for visualization
             predicted_state = vio_filter.state_estimate()
 
-            # Vision update (pass FlowDep for landmark depth warm-start)
+            # Vision update (pass FlowDep / SparseVog for landmark depth warm-start)
             timer.start("vision_update")
-            vio_filter.process_vision(meas, camera, flowdep=flowdep_filter, tracker=tracker)
+            vio_filter.process_vision(
+                meas, camera,
+                flowdep=flowdep_filter,
+                sparse_vog=sparse_vog_filter,
+                tracker=tracker,
+            )
             timer.stop("vision_update")
             vision_count += 1
 
@@ -408,6 +462,14 @@ def main():
             state = vio_filter.state_estimate()
             timestamps_out.append(vio_filter.get_time())
             states_out.append(state)
+
+            # Sparse Vogiatzis filter: propagate + update per-feature depth
+            if sparse_vog_filter is not None:
+                timer.start("sparse_vog")
+                T_WC_sv = (state.sensor.pose * state.sensor.camera_offset).asMatrix()
+                P_vv_sv = vio_filter.get_velocity_cov()
+                sparse_vog_filter.update(meas, T_WC_sv, P_vv=P_vv_sv)
+                timer.stop("sparse_vog")
 
             # FlowDep: feed EqF camera pose + grayscale image
             if flowdep_filter is not None:
@@ -434,9 +496,35 @@ def main():
             cam_pos = None
             R_GtoC = None
 
+            # Sparse Vogiatzis pool → PlaneDetector (priority over FlowDep grid)
+            if sparse_vog_plane_detector is not None and sparse_vog_filter is not None:
+                timer.start("plane_detect")
+                sv_uvs = sparse_vog_filter.feat_uvs
+                sv_pos = sparse_vog_filter.feat_positions_global(state)
+                if len(sv_pos) >= 3:
+                    if cam_pos is None:
+                        feat_pos, cam_pos, R_GtoC = landmarks_to_global(state)
+                    sparse_vog_plane_detector.update(sv_uvs, sv_pos, cam_pos, R_GtoC)
+                    feat2plane = sparse_vog_plane_detector.feat2plane
+                    tri_data = sparse_vog_plane_detector.delaunay_data
+                timer.stop("plane_detect")
+
+                if feat2plane:
+                    timer.start("plane_fit")
+                    if not feat_pos:
+                        feat_pos, cam_pos, R_GtoC = landmarks_to_global(state)
+                    # Fit uses sparse_vog world positions, not the EqF's
+                    plane_cps, plane_inliers = fit_detected_planes(feat2plane, sv_pos)
+                    timer.stop("plane_fit")
+
+                if plane_cps and args.planes:
+                    timer.start("plane_augment")
+                    vio_filter.augment_planes(plane_cps, plane_inliers)
+                    timer.stop("plane_augment")
+
             # FlowDep mesh plane detection: grid pseudo-features → PlaneDetector
             # → relabel EqVIO landmarks → fit CP on EqVIO landmarks
-            if flowdep_plane_detector is not None and flowdep_filter is not None and flowdep_filter.invdepth_state is not None:
+            elif flowdep_plane_detector is not None and flowdep_filter is not None and flowdep_filter.invdepth_state is not None:
                 timer.start("plane_detect")
                 # Get grid pseudo-features in world frame
                 grid_uvs, grid_pos = flowdep_filter.grid_features_global(T_WC)
@@ -505,6 +593,23 @@ def main():
 
             # Camera debug window
             if cam_debug is not None:
+                # Build sparse Vogiatzis depth dict for overlay.
+                sv_depths = None
+                if sparse_vog_filter is not None:
+                    s_sv = sparse_vog_filter.settings
+                    sv_depths = {}
+                    for fid, feat in sparse_vog_filter.features.items():
+                        if feat.depth <= 0:
+                            continue
+                        ab = feat.a + feat.b
+                        inlier_ratio = (feat.a / ab) if ab > 0 else 0.0
+                        converged = (
+                            feat.track_length >= s_sv.min_track_length
+                            and inlier_ratio >= s_sv.conv_inlier_ratio
+                            and feat.depth_var <= s_sv.conv_variance_threshold
+                        )
+                        sv_depths[fid] = (float(feat.depth), float(feat.depth_var), converged)
+
                 slam_ids = {lm.id for lm in state.camera_landmarks}
                 tri_kw = {}
                 if tri_data is not None:
@@ -526,6 +631,7 @@ def main():
                     grid_cols=fd_gcols_cam,
                     grid_stride=flowdep_settings.grid_stride if flowdep_filter is not None else 8,
                     grid_image_scale=flowdep_settings.image_scale if flowdep_filter is not None else 1.0,
+                    sparse_vog_depths=sv_depths,
                     **tri_kw,
                 )
                 if not cam_debug.enabled:   # user pressed 'q'
@@ -549,10 +655,18 @@ def main():
                 n_planes = len(set(feat2plane.values())) if feat2plane else 0
                 n_fitted = len(plane_cps)
                 n_filter_planes = len(state.plane_landmarks)
+                sv_extra = ""
+                if sparse_vog_filter is not None:
+                    sv_extra = (
+                        f"  tracked={len(features)}  "
+                        f"vog={len(sparse_vog_filter.features)}"
+                        f"({sparse_vog_filter.num_converged()} conv)"
+                    )
                 print(f"  [{vision_count:4d}] t={stamp:.3f}  "
                       f"pos=({pos[0]:+.2f}, {pos[1]:+.2f}, {pos[2]:+.2f})  "
                       f"landmarks={len(state.camera_landmarks)}  "
-                      f"planes={n_planes} ({n_fitted} fitted, {n_filter_planes} in filter)")
+                      f"planes={n_planes} ({n_fitted} fitted, {n_filter_planes} in filter)"
+                      f"{sv_extra}")
                 for pid, cp in plane_cps.items():
                     n_on = sum(1 for p in feat2plane.values() if p == pid)
                     in_state = "✓" if pid in {pl.id for pl in state.plane_landmarks} else " "

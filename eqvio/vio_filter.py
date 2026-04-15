@@ -195,9 +195,12 @@ class VIOFilterSettings:
         s.use_feature_predictions = st.get('useFeaturePredictions', s.use_feature_predictions)
         s.coordinate_choice = st.get('coordinateChoice', s.coordinate_choice)
 
-        # GIFT section for feature management
+        # Core EqF landmark cap (distinct from GIFT tracker pool).
+        s.max_landmarks = eqf.get('maxFeatures', s.max_landmarks)
+
+        # GIFT section — only featureDist lives here now; tracker pool is
+        # read directly in run_euroc.py.
         gift = config.get('GIFT', {})
-        s.max_landmarks = gift.get('maxFeatures', s.max_landmarks)
         s.min_feature_distance = gift.get('featureDist', s.min_feature_distance)
 
         return s
@@ -392,7 +395,14 @@ class VIOFilter:
     # Vision processing
     # -------------------------------------------------------------------
 
-    def process_vision(self, measurement: VisionMeasurement, camera, flowdep=None, tracker=None):
+    def process_vision(
+        self,
+        measurement: VisionMeasurement,
+        camera,
+        flowdep=None,
+        tracker=None,
+        sparse_vog=None,
+    ):
         """Process a vision measurement: manage features, then Kalman update.
 
         Reference: VIOFilter::processVisionData()
@@ -401,6 +411,9 @@ class VIOFilter:
             measurement: VisionMeasurement with tracked features
             camera:      GIFT camera model
             flowdep:     Optional FlowDepFilter for warm-starting landmark depth
+            sparse_vog:  Optional SparseVogiatzisFilter. Takes priority over
+                         flowdep for new-landmark depth warm-start; returns
+                         metric depth directly (canonical Euclidean).
             tracker:     Optional GIFT tracker. If provided, outlier-rejected
                          features are also discarded from the tracker so it
                          re-detects fresh corners next frame (VINS-FUSION
@@ -457,7 +470,11 @@ class VIOFilter:
                 bearing = camera.undistort_point(pixel)
 
                 depth = self.settings.initial_scene_depth
-                if flowdep is not None:
+                if sparse_vog is not None:
+                    sv_depth, _ = sparse_vog.query(fid)
+                    if sv_depth > 0:
+                        depth = sv_depth
+                if depth == self.settings.initial_scene_depth and flowdep is not None:
                     fd_val, fd_var = flowdep.query(pixel[0], pixel[1])
                     if fd_val > 0:
                         if flowdep.settings.chart_type.value == "invdepth":
