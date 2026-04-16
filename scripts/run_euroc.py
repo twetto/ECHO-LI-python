@@ -360,9 +360,22 @@ def main():
     sparse_vog_filter = None
     sparse_vog_plane_detector = None
     if args.sparse_vog:
-        from eqvio.sparse_vogiatzis import SparseVogiatzisFilter, SparseVogSettings
+        from eqvio.sparse_vogiatzis import SparseVogiatzisFilter, SparseVogSettings, DepthParametrization
         sv_cfg = config.get('SparseVog', {}) if args.config.exists() else {}
+
+        param_str = sv_cfg.get('parametrization', 'invdepth').strip().lower()
+        if param_str == 'euclidean':
+            param = DepthParametrization.EUCLIDEAN
+        elif param_str == 'invdepth':
+            param = DepthParametrization.INVDEPTH
+        elif param_str == 'polar':
+            param = DepthParametrization.POLAR
+        else:
+            print(f"Unknown SparseVog parametrization '{param_str}', defaulting to INVDEPTH")
+            param = DepthParametrization.INVDEPTH
+
         sparse_vog_settings = SparseVogSettings(
+            parametrization=param,
             max_pool_size=sv_cfg.get('max_pool_size', 300),
             min_track_length=sv_cfg.get('min_track_length', 5),
             conv_inlier_ratio=sv_cfg.get('conv_inlier_ratio', 0.7),
@@ -370,6 +383,9 @@ def main():
             init_depth_var=sv_cfg.get('init_depth_var', 1.0),
             sigma_pixel=sv_cfg.get('sigma_pixel', 0.5),
             uniform_z_max=sv_cfg.get('uniform_z_max', 20.0),
+            uniform_rho_max=sv_cfg.get('uniform_rho_max', 10.0),
+            uniform_d_min=sv_cfg.get('uniform_d_min', -5.0),
+            uniform_d_max=sv_cfg.get('uniform_d_max', 5.0),
             a_init=sv_cfg.get('a_init', 10.0),
             b_init=sv_cfg.get('b_init', 2.0),
             ab_min=sv_cfg.get('ab_min', 1.0),
@@ -382,6 +398,12 @@ def main():
             min_depth=sv_cfg.get('min_depth', 0.1),
             max_depth=sv_cfg.get('max_depth', 100.0),
         )
+        dist_coeffs_sv = np.array(
+            getattr(camera, 'dist', [0.0, 0.0, 0.0, 0.0]), dtype=np.float64
+        )
+        if np.all(dist_coeffs_sv == 0.0):
+            dist_coeffs_sv = None
+        sparse_vog_settings.dist_coeffs = dist_coeffs_sv
         sparse_vog_filter = SparseVogiatzisFilter(camera.K_matrix(), sparse_vog_settings)
         sparse_vog_plane_detector = PlaneDetector(PlaneDetectorSettings(
             max_tri_side_px=sv_cfg.get('pd_max_tri_side_px', 200),
@@ -389,7 +411,8 @@ def main():
             max_norm_deg=sv_cfg.get('pd_max_norm_deg', 25),
             min_plane_features=sv_cfg.get('pd_min_plane_features', 4),
         ))
-        print(f"SparseVog enabled (max_pool={sparse_vog_settings.max_pool_size}, "
+        print(f"SparseVog enabled (param={sparse_vog_settings.parametrization.name}, "
+              f"max_pool={sparse_vog_settings.max_pool_size}, "
               f"min_track={sparse_vog_settings.min_track_length}, "
               f"conv_ratio={sparse_vog_settings.conv_inlier_ratio})")
 

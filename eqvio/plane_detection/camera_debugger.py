@@ -52,11 +52,8 @@ class CameraDebugWindow:
         self.wait_ms = wait_ms
         self._window_created = False
         self._prev_features = None
-        # Sparse Vogiatzis depth overlay toggle ('v').
         self._show_sparse_vog = True
-        # Fixed clip range for depth colourmap (m). Auto-adjusted if data
-        # falls outside.
-        self._sv_depth_clip = (0.5, 15.0)
+        self._sv_depth_clip = None
 
     # ------------------------------------------------------------------
 
@@ -145,7 +142,7 @@ class CameraDebugWindow:
         # Sparse Vogiatzis depth overlay (rings coloured by depth)
         if self._show_sparse_vog and sparse_vog_depths:
             img_out = self._overlay_sparse_vog(
-                img_out, feat_uvs, sparse_vog_depths, self._sv_depth_clip,
+                img_out, feat_uvs, sparse_vog_depths,
             )
 
         # Mode indicator
@@ -244,20 +241,27 @@ class CameraDebugWindow:
         cv2.addWeighted(overlay, alpha, img_out, 1 - alpha, 0, img_out)
         return img_out
 
-    @staticmethod
     def _overlay_sparse_vog(
+        self,
         img_out: np.ndarray,
         feat_uvs: dict[int, tuple[float, float]],
         sparse_vog_depths: dict[int, tuple[float, float, bool]],
-        depth_clip: tuple[float, float],
     ) -> np.ndarray:
         """Draw sparse Vogiatzis features as rings coloured by depth.
 
         sparse_vog_depths: {feat_id: (depth, depth_var, converged)}.
         Filled circle when converged, open ring otherwise.
+        Uses JET colormap with min-max normalization over active (converged) points.
         """
-        vmin, vmax = depth_clip
+        active_depths = [d for d, _v, c in sparse_vog_depths.values() if d > 0 and c]
+        if not active_depths:
+            return img_out
+
+        vmin = min(active_depths)
+        vmax = max(active_depths)
+        self._sv_depth_clip = (vmin, vmax)
         span = max(vmax - vmin, 1e-6)
+
         for fid, (depth, _var, converged) in sparse_vog_depths.items():
             if depth <= 0:
                 continue
@@ -266,7 +270,7 @@ class CameraDebugWindow:
                 continue
             normed = np.clip((depth - vmin) / span, 0.0, 1.0)
             gray = np.array([[int(normed * 255)]], dtype=np.uint8)
-            bgr = cv2.applyColorMap(gray, cv2.COLORMAP_TURBO)[0, 0]
+            bgr = cv2.applyColorMap(gray, cv2.COLORMAP_JET)[0, 0]
             colour = (int(bgr[0]), int(bgr[1]), int(bgr[2]))
             pt = (int(round(uv[0])), int(round(uv[1])))
             if converged:
