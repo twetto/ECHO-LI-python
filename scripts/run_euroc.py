@@ -35,7 +35,7 @@ from eqvio.mathematical.vio_state import VIOState, StampedPose
 from eqvio.vio_filter import VIOFilter, VIOFilterSettings
 
 # GIFT imports
-from gift.tracker import PointFeatureTracker
+from gift.tracker import PointFeatureTracker, OcclusionCheckMethod, _DEFAULT_OCCLUSION_THRESHOLDS
 from gift.feature import Feature
 
 # Plane detection
@@ -173,6 +173,16 @@ def main():
     tracker.settings.use_fast_features = gift_config.get('useFastFeatures', False)
     tracker.settings.equalise_image_histogram = gift_config.get('equaliseImageHistogram', False)
 
+    # Occlusion detection settings (default: RI-LBP)
+    occ_method_str = gift_config.get('occlusionCheckMethod', 'lbp')
+    occ_method = OcclusionCheckMethod(occ_method_str.lower())
+    tracker.settings.occlusion_check_method = occ_method
+    tracker.settings.occlusion_check_threshold = gift_config.get(
+        'occlusionCheckThreshold', _DEFAULT_OCCLUSION_THRESHOLDS[occ_method],
+    )
+    tracker.settings.reference_patch_size = gift_config.get('referencePatchSize', 15)
+    tracker.settings.lbp_radius = gift_config.get('lbpRadius', 3)
+
     # RANSAC settings
     ransac_config = gift_config.get('ransacParams', {})
     if ransac_config:
@@ -194,7 +204,8 @@ def main():
         print(f"Tracker pool decoupled: tracker={tracker_cap}, eqf={settings.max_landmarks}")
 
     print(f"Tracker: PointFeatureTracker, max_features={tracker.settings.max_features}, "
-          f"feature_dist={tracker.settings.feature_dist:.1f}")
+          f"feature_dist={tracker.settings.feature_dist:.1f}, "
+          f"occlusion={tracker.settings.occlusion_check_method.value}")
 
     # ------------------------------------------------------------------
     # 4. Preload data into time-sorted stream
@@ -468,7 +479,8 @@ def main():
                 timer.start("sparse_vog")
                 T_WC_sv = (state.sensor.pose * state.sensor.camera_offset).asMatrix()
                 P_vv_sv = vio_filter.get_velocity_cov()
-                sparse_vog_filter.update(meas, T_WC_sv, P_vv=P_vv_sv)
+                sparse_vog_filter.update(meas, T_WC_sv, P_vv=P_vv_sv,
+                                        flowdep=flowdep_filter)
                 timer.stop("sparse_vog")
 
             # FlowDep: feed EqF camera pose + grayscale image

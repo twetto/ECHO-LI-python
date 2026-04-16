@@ -123,8 +123,16 @@ class SparseVogiatzisFilter:
         measurement: VisionMeasurement,
         T_WC: np.ndarray,
         P_vv: Optional[np.ndarray] = None,
+        flowdep=None,
     ) -> None:
-        """Propagate + update each tracked feature's depth belief."""
+        """Propagate + update each tracked feature's depth belief.
+
+        Parameters
+        ----------
+        flowdep : optional FlowDepFilter
+            When provided, new features are seeded with FlowDep's dense
+            depth estimate instead of the first triangulation.
+        """
         stamp = measurement.stamp
         curr_uvs = {
             fid: uv.astype(np.float64).copy()
@@ -163,14 +171,23 @@ class SparseVogiatzisFilter:
             if z_obs <= 0.0:
                 continue
 
-            # Initialise from first valid triangulation.
+            # Initialise new feature: FlowDep seed > first triangulation.
             if feat is None:
                 if len(self._features) >= self.settings.max_pool_size:
                     continue
+                init_depth = z_obs
+                init_var = self.settings.init_depth_var
+                if flowdep is not None:
+                    fd_depth, fd_var = flowdep.query_depth(
+                        float(uv_curr[0]), float(uv_curr[1]),
+                    )
+                    if fd_depth > 0:
+                        init_depth = fd_depth
+                        init_var = fd_var
                 feat = FeatureState(
                     feat_id=fid,
-                    depth=z_obs,
-                    depth_var=self.settings.init_depth_var,
+                    depth=init_depth,
+                    depth_var=init_var,
                     a=self.settings.a_init,
                     b=self.settings.b_init,
                 )

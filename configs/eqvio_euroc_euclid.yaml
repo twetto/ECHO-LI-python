@@ -15,6 +15,11 @@ GIFT:
     minInliers: 15
   trackedFeatureDist: 15.0
   winSize: 21
+  # Occlusion detection: none, zncc, lbp, orb
+  occlusionCheckMethod: lbp     # RI-LBP (rotation-invariant local binary pattern)
+  occlusionCheckThreshold: 0.1  # method-dependent: zncc=0.8, lbp=0.1, orb=2000
+  referencePatchSize: 15        # patch window for LBP/ORB/ZNCC descriptor extraction
+  lbpRadius: 3                  # RI-LBP sampling radius
 eqf:
   maxFeatures: 40           # core EqF landmark cap
   initialValue:
