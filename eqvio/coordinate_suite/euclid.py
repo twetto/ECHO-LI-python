@@ -158,7 +158,7 @@ def state_matrix_A_euclid(
     R_IC = xi_hat.sensor.camera_offset.R.asMatrix()
     R_Ahat = X.A.R.asMatrix()
     common_term = X.B.inverse().Adjoint() @ SE3.adjoint(transformed)
-    U_C_full = Ad_Tc_inv @ U_I
+    U_C_full = xi_hat.sensor.camera_offset.inverse().Adjoint() @ U_I
     v_C = U_C_full[3:6]
 
     # ===================================================================
