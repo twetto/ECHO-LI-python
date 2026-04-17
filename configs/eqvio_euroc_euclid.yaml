@@ -93,7 +93,9 @@ FlowDep:
   min_inlier_ratio: 0.5      # gate query() landmark init
   mahalanobis_reset_chi2: 9.0  # reset stuck outlier pixels when obs disagrees (<=0 disables)
 SparseVog:
-  # Per-feature 1D Vogiatzis filter (canonical: Euclidean depth).
+  # Per-feature Vogiatzis filter.
+  # parametrization: euclidean, invdepth, polar (1D scalar)
+  #                   polar3d (3D Local IEKF on Normal chart)
   parametrization: polar
   max_pool_size: 300
   min_track_length: 5

@@ -370,6 +370,8 @@ def main():
             param = DepthParametrization.INVDEPTH
         elif param_str == 'polar':
             param = DepthParametrization.POLAR
+        elif param_str == 'polar3d':
+            param = DepthParametrization.POLAR3D
         else:
             print(f"Unknown SparseVog parametrization '{param_str}', defaulting to INVDEPTH")
             param = DepthParametrization.INVDEPTH
@@ -404,7 +406,19 @@ def main():
         if np.all(dist_coeffs_sv == 0.0):
             dist_coeffs_sv = None
         sparse_vog_settings.dist_coeffs = dist_coeffs_sv
-        sparse_vog_filter = SparseVogiatzisFilter(camera.K_matrix(), sparse_vog_settings)
+
+        if param == DepthParametrization.POLAR3D:
+            from eqvio.sparse_vogiatzis import SparseVogiatzisFilter3D
+            sparse_vog_filter = SparseVogiatzisFilter3D(
+                camera.K_matrix(),
+                sparse_vog_settings,
+                cam_ptr=camera,
+            )
+        else:
+            sparse_vog_filter = SparseVogiatzisFilter(
+                camera.K_matrix(),
+                sparse_vog_settings,
+            )
         sparse_vog_plane_detector = PlaneDetector(PlaneDetectorSettings(
             max_tri_side_px=sv_cfg.get('pd_max_tri_side_px', 200),
             max_dist_between_z=sv_cfg.get('pd_max_dist_between_z', 0.15),
@@ -636,11 +650,9 @@ def main():
                     for fid, feat in sparse_vog_filter.features.items():
                         if feat.depth <= 0:
                             continue
-                        ab = feat.a + feat.b
-                        inlier_ratio = (feat.a / ab) if ab > 0 else 0.0
                         converged = (
                             feat.track_length >= s_sv.min_track_length
-                            and inlier_ratio >= s_sv.conv_inlier_ratio
+                            and feat.inlier_ratio() >= s_sv.conv_inlier_ratio
                             and feat.depth_var <= s_sv.conv_variance_threshold
                         )
                         sv_depths[fid] = (float(feat.depth), float(feat.depth_var), converged)

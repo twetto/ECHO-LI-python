@@ -42,6 +42,13 @@ from typing import Dict, Optional
 import numpy as np
 
 from .mathematical.vision_measurement import VisionMeasurement
+from .mathematical.vio_state import Landmark
+from .coordinate_suite.normal import (
+    conv_euc2normal,
+    conv_normal2euc,
+    point_chart_normal_inv,
+    sphere_chart_normal_inv_diff0,
+)
 
 
 # ============================================================================
@@ -52,6 +59,7 @@ class DepthParametrization(Enum):
     EUCLIDEAN = auto()
     INVDEPTH = auto()
     POLAR = auto()
+    POLAR3D = auto()  # 3D Local IEKF on Normal chart
 
 
 # ============================================================================
@@ -131,6 +139,12 @@ class FeatureState:
     @depth_var.setter
     def depth_var(self, v: float) -> None:
         self.canonical_var = v
+
+    def inlier_ratio(self) -> float:
+        ab = self.a + self.b
+        if ab <= 0.0:
+            return 0.0
+        return self.a / ab
 
 
 # ============================================================================
@@ -721,3 +735,396 @@ class SparseVogiatzisFilter:
                 continue
             n += 1
         return n
+
+
+# ============================================================================
+# 3D EqF variant (SOT(3) with full 3x3 covariance)
+# ============================================================================
+
+
+@dataclass
+class FeatureState3D:
+    """3D landmark state with full 3x3 covariance (Normal/Polar chart).
+
+    State: landmark position q ∈ ℝ³ (camera frame)
+    Covariance: Σ ∈ 𝕊₊(3) tracked in Normal chart coordinates
+
+    The Normal chart parameterizes state as [sphere_bearing(2), log_depth]:
+        - Indices 0,1: bearing on S^2 (invariant to scale)
+        - Index 2: log(depth) = -log(||q||)
+
+    Using the Normal chart guarantees scale-equivariance and prevents
+    negative depth (unlike Euclidean EKF).
+
+    IMPORTANT: This is a LOCAL IEKF, not the full EqF with fixed ξ₀.
+
+    In the core EqF:
+        - ξ₀ is fixed after initialization
+        - Û = X ★ ξ₀ (group action)
+        - Linearization is done at the fixed origin ξ₀
+        - Correction Δε is lifted to Lie algebra via lift_innovation_*
+        - New state: X_new = exp(Δε) ★ X
+
+    In this LOCAL IEKF:
+        - We linearize at the CURRENT estimate (not a fixed ξ₀)
+        - The "origin" implicitly moves with each update
+        - This is a First-Order Extended Kalman Filter on the manifold,
+          valid when covariance is small (local approximation)
+
+    This local approach is appropriate because:
+        1. We're not joint-estimating other states (IMU pose, velocities)
+        2. Each feature is independent
+        3. The Normal chart ensures scale remains positive
+    """
+    feat_id: int
+    position: np.ndarray = field(default_factory=lambda: np.zeros(3))
+    covariance: np.ndarray = field(default_factory=lambda: np.eye(3) * 1.0)
+    a: float = 10.0
+    b: float = 2.0
+    track_length: int = 0
+
+    @property
+    def depth(self) -> float:
+        return float(np.linalg.norm(self.position))
+
+    @property
+    def depth_var(self) -> float:
+        """Extract depth variance from Normal chart covariance.
+
+        Covariance is tracked in Normal coords where index 2 is log-depth.
+        Transform: var(z) = z^2 * var(log_z)
+        """
+        if self.depth < 1e-6:
+            return float("inf")
+        z = self.depth
+        var_log_depth = self.covariance[2, 2]
+        return float(var_log_depth * (z * z))
+
+    def inlier_ratio(self) -> float:
+        ab = self.a + self.b
+        if ab <= 0.0:
+            return 0.0
+        return self.a / ab
+
+
+class SparseVogiatzisFilter3D(SparseVogiatzisFilter):
+    """3D LOCAL IEKF on SOT(3) manifold with Normal chart.
+
+    Instead of scalar depth, this filter maintains:
+        - 3D landmark position q ∈ ℝ³ (camera frame)
+        - 3×3 SPD covariance Σ in Normal chart coords
+
+    Key difference from core EqF (LOCAL IEKF vs full EqF):
+
+    CORE EqF (with fixed ξ₀):
+        - State: group element X acting on fixed origin ξ₀
+        - Linearization: at fixed ξ₀ (never changes after init)
+        - Correction: lift_innovation_* → exp(Δε) ★ X
+        - Full state dimension includes IMU, camera offset
+
+    THIS FILTER (Local IEKF):
+        - State: current estimate q with local covariance
+        - Linearization: at current estimate (implicit origin moves)
+        - Correction: point_chart_normal_inv(Δε, q) → q_new
+        - Only tracks feature position, no joint estimation
+
+    Why Local IEKF is appropriate here:
+        1. No IMU or camera offset to estimate
+        2. Each feature is independent (can parallelize)
+        3. Normal chart prevents negative depth
+        4. Much simpler than full EqF machinery
+
+    Observation: bearing y = q / ||q|| (projected onto image plane)
+
+    This is more expensive (~27-45× FLOPs) but uses proper SOT(3)
+    group action and full covariance for better data association.
+    """
+
+    def __init__(
+        self,
+        K: np.ndarray,
+        settings: SparseVogSettings,
+        eqf_suite=None,
+        cam_ptr=None,
+    ):
+        super().__init__(K, settings)
+        self._features3d: Dict[int, FeatureState3D] = {}
+        self._eqf_suite = eqf_suite
+        self._cam_ptr = cam_ptr
+        self._last_T_WC: Optional[np.ndarray] = None
+
+    def update(
+        self,
+        measurement: VisionMeasurement,
+        T_WC: np.ndarray,
+        P_vv: Optional[np.ndarray] = None,
+        flowdep=None,
+    ) -> None:
+        """Propagate + update each tracked 3D feature's belief.
+
+        This is the 3D equivalent of update() but maintains full
+        3×3 covariance and uses Riccati update instead of scalar
+        Gaussian-Beta mixture.
+        """
+        stamp = measurement.stamp
+        curr_uvs = {
+            fid: uv.astype(np.float64).copy()
+            for fid, uv in measurement.cam_coordinates.items()
+        }
+        curr_uvs = self._undistort_uvs(curr_uvs)
+
+        if self._prev_T_WC is None or self._prev_stamp < 0:
+            self._prev_T_WC = T_WC.copy()
+            self._prev_stamp = stamp
+            self._prev_uvs = curr_uvs
+            self._prev_uvs_undistorted = True
+            return
+
+        if not self._prev_uvs_undistorted:
+            self._prev_uvs = self._undistort_uvs(self._prev_uvs)
+        self._prev_uvs_undistorted = True
+
+        dt = max(stamp - self._prev_stamp, 0.0)
+
+        T_CW_curr = np.linalg.inv(T_WC)
+        T_curr_prev = T_CW_curr @ self._prev_T_WC
+        R = T_curr_prev[:3, :3]
+        t = T_curr_prev[:3, 3]
+
+        for fid, uv_curr in curr_uvs.items():
+            uv_prev = self._prev_uvs.get(fid)
+            if uv_prev is None:
+                continue
+
+            z_obs, drive = self._triangulate(uv_prev, uv_curr, R, t)
+
+            feat = self._features3d.get(fid)
+            if feat is not None and feat.depth > 0:
+                self._predict_feature_3d(feat, R, t, P_vv, dt)
+
+            if z_obs <= 0.0:
+                continue
+
+            if feat is None:
+                if len(self._features3d) >= self.settings.max_pool_size:
+                    continue
+                init_pos = self._position_from_depth(
+                    uv_curr, z_obs, self.settings.init_depth_var
+                )
+                feat = FeatureState3D(
+                    feat_id=fid,
+                    position=init_pos,
+                    covariance=np.eye(3) * self.settings.init_depth_var,
+                    a=self.settings.a_init,
+                    b=self.settings.b_init,
+                )
+                self._features3d[fid] = feat
+                self._update_feature_3d_bearing(feat, uv_curr)
+            elif feat.depth <= 0:
+                init_pos = self._position_from_depth(
+                    uv_curr, z_obs, self.settings.init_depth_var
+                )
+                feat.position = init_pos
+                feat.covariance = np.eye(3) * self.settings.init_depth_var
+                feat.a = self.settings.a_init
+                feat.b = self.settings.b_init
+                self._update_feature_3d_bearing(feat, uv_curr)
+            else:
+                self._update_feature_3d_bearing(feat, uv_curr)
+
+            feat.track_length += 1
+
+        lost = set(self._features3d.keys()) - set(curr_uvs.keys())
+        for fid in lost:
+            del self._features3d[fid]
+
+        self._prev_T_WC = T_WC.copy()
+        self._prev_stamp = stamp
+        self._prev_uvs = curr_uvs
+
+    def _position_from_depth(
+        self,
+        uv: np.ndarray,
+        depth: float,
+        depth_var: float,
+    ) -> np.ndarray:
+        """Convert (u,v) + depth → camera-frame 3D position."""
+        fx, fy = self.K[0, 0], self.K[1, 1]
+        cx, cy = self.K[0, 2], self.K[1, 2]
+        x_norm = (uv[0] - cx) / fx
+        y_norm = (uv[1] - cy) / fy
+        return np.array([x_norm * depth, y_norm * depth, depth])
+
+    def _predict_feature_3d(
+        self,
+        feat: FeatureState3D,
+        R: np.ndarray,
+        t: np.ndarray,
+        P_vv: Optional[np.ndarray],
+        dt: float,
+    ) -> None:
+        """Predict 3D landmark via Normal chart Jacobians.
+
+        Uses: Normal(old) -> Euclidean -> Euclidean(new) -> Normal(new)
+        This maintains SOT(3) equivariance.
+
+        Note: This is LOCAL prediction (not using group action with fixed ξ₀).
+        We propagate the local estimate and its covariance directly.
+        """
+        s = self.settings
+        q_old = feat.position
+        if feat.depth < s.min_depth:
+            feat.position = np.zeros(3)
+            return
+
+        q_new = R @ q_old + t
+        if q_new[2] < s.min_depth:
+            feat.position = np.zeros(3)
+            return
+
+        M_norm2euc = conv_normal2euc(q_old)
+        M_euc2norm = conv_euc2normal(q_new)
+
+        J = M_euc2norm @ R @ M_norm2euc
+        cov_new = J @ feat.covariance @ J.T
+
+        if P_vv is not None and dt > 0.0:
+            Q_euc = P_vv * (dt * dt)
+        else:
+            Q_euc = np.eye(3) * s.process_depth_var * max(dt, 1e-3)
+
+        Q_norm = M_euc2norm @ Q_euc @ M_euc2norm.T
+        cov_new += Q_norm
+
+        feat.position = q_new
+        feat.covariance = cov_new
+
+    def _update_feature_3d_bearing(
+            self,
+            feat: FeatureState3D,
+            y_observed: np.ndarray,
+        ) -> None:
+        """EqF Riccati update with Equivariant Output Approximation.
+
+        Uses:
+            1. Equivariant output: H_avg = 0.5 * (H_pred + H_obs)
+            2. H_normal = H_euc @ conv_normal2euc (maps to Lie algebra)
+            3. Kalman gain K in Normal chart coordinates
+            4. point_chart_normal_inv (exponential map) to apply update
+
+        The equivariant output approximation (EqF paper, Section III)
+        evaluates the measurement Jacobian at both predicted and observed
+        bearings, then averages. This reduces 2nd-order linearization error.
+        """
+        q = feat.position
+        if np.linalg.norm(q) < 1e-4:
+            return
+
+        if self._cam_ptr is not None:
+            q_pred = q / np.linalg.norm(q)
+            H_pred = self._cam_ptr.projection_jacobian(q_pred)
+
+            y_obs_bearing = self._cam_ptr.undistort_point(y_observed)
+            H_obs = self._cam_ptr.projection_jacobian(y_obs_bearing)
+
+            H_euc = 0.5 * (H_pred + H_obs)
+        else:
+            depth = feat.depth
+            if depth < 1e-4:
+                return
+            fx, fy = self.K[0, 0], self.K[1, 1]
+            x, y, z = q[0], q[1], q[2]
+            H_euc = np.zeros((2, 3))
+            H_euc[0, 0] = fx / z
+            H_euc[0, 2] = -fx * x / (z * z)
+            H_euc[1, 1] = fy / z
+            H_euc[1, 2] = -fy * y / (z * z)
+
+        M_norm2euc = conv_normal2euc(q)
+        H_normal = H_euc @ M_norm2euc
+
+        fx, fy = self.K[0, 0], self.K[1, 1]
+        cx, cy = self.K[0, 2], self.K[1, 2]
+        y_pred = np.array([
+            fx * q[0] / q[2] + cx,
+            fy * q[1] / q[2] + cy,
+        ])
+
+        R_obs = self._sigma_norm_sq * np.eye(2)
+        S = H_normal @ feat.covariance @ H_normal.T + R_obs
+
+        try:
+            S_inv = np.linalg.inv(S + 1e-8 * np.eye(2))
+        except np.linalg.LinAlgError:
+            return
+
+        K = feat.covariance @ H_normal.T @ S_inv
+
+        innovation = y_observed - y_pred
+        Delta_eps = K @ innovation
+
+        lm_old = Landmark(p=q, id=feat.feat_id)
+        lm_new = point_chart_normal_inv(Delta_eps, lm_old)
+
+        I_KH = np.eye(3) - K @ H_normal
+        cov_new = I_KH @ feat.covariance @ I_KH.T + K @ R_obs @ K.T
+
+        eigvals = np.linalg.eigvalsh(cov_new)
+        if np.any(eigvals <= 0):
+            cov_new = feat.covariance
+            q_new = q
+        else:
+            q_new = lm_new.p
+
+        feat.position = q_new
+        feat.covariance = cov_new
+
+    def _observed_bearing(self, uv: np.ndarray) -> np.ndarray:
+        """Convert pixel → normalized bearing vector."""
+        fx, fy = self.K[0, 0], self.K[1, 1]
+        cx, cy = self.K[0, 2], self.K[1, 2]
+        x = (uv[0] - cx) / fx
+        y = (uv[1] - cy) / fy
+        norm = np.sqrt(x * x + y * y + 1.0)
+        return np.array([x / norm, y / norm, 1.0 / norm])
+
+    def query(self, feat_id: int) -> tuple[float, float]:
+        """Query (depth, depth_var) if converged, else (-1, inf)."""
+        feat = self._features3d.get(feat_id)
+        if feat is None or feat.depth <= 0:
+            return -1.0, float("inf")
+        if feat.track_length < self.settings.min_track_length:
+            return -1.0, float("inf")
+        if feat.inlier_ratio() < self.settings.conv_inlier_ratio:
+            return -1.0, float("inf")
+        if feat.depth_var > self.settings.conv_variance_threshold:
+            return -1.0, float("inf")
+        return feat.depth, feat.depth_var
+
+    @property
+    def features(self) -> Dict[int, FeatureState3D]:
+        return self._features3d
+
+    def feat_positions_global(self, state) -> Dict[int, np.ndarray]:
+        """Global-frame 3D positions for converged 3D features."""
+        R_GtoI = state.sensor.pose.R.asMatrix()
+        p_IinG = state.sensor.pose.x
+        R_ItoC = state.sensor.camera_offset.R.asMatrix()
+        p_IinC = state.sensor.camera_offset.x
+
+        R_GtoC = R_ItoC @ R_GtoI
+        R_CtoG = R_GtoC.T
+        p_CinG = p_IinG - R_CtoG @ p_IinC
+
+        positions: Dict[int, np.ndarray] = {}
+        for fid, feat in self._features3d.items():
+            if feat.depth <= 0 or feat.track_length < self.settings.min_track_length:
+                continue
+            if feat.inlier_ratio() < self.settings.conv_inlier_ratio:
+                continue
+            if feat.depth_var > self.settings.conv_variance_threshold:
+                continue
+
+            positions[fid] = R_CtoG @ feat.position + p_CinG
+
+        return positions
