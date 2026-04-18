@@ -919,7 +919,7 @@ class SparseVogiatzisFilter3D(SparseVogiatzisFilter):
                     b=self.settings.b_init,
                 )
                 self._features3d[fid] = feat
-                self._update_feature_3d_bearing(feat, uv_curr)
+                self._update_feature_3d(feat, uv_curr, z_obs, drive)
             elif feat.depth <= 0:
                 init_pos = self._position_from_depth(
                     uv_curr, z_obs, self.settings.init_depth_var
@@ -928,9 +928,9 @@ class SparseVogiatzisFilter3D(SparseVogiatzisFilter):
                 feat.covariance = np.eye(3) * self.settings.init_depth_var
                 feat.a = self.settings.a_init
                 feat.b = self.settings.b_init
-                self._update_feature_3d_bearing(feat, uv_curr)
+                self._update_feature_3d(feat, uv_curr, z_obs, drive)
             else:
-                self._update_feature_3d_bearing(feat, uv_curr)
+                self._update_feature_3d(feat, uv_curr, z_obs, drive)
 
             feat.track_length += 1
 
@@ -999,32 +999,67 @@ class SparseVogiatzisFilter3D(SparseVogiatzisFilter):
         feat.position = q_new
         feat.covariance = cov_new
 
-    def _update_feature_3d_bearing(
+    def _update_feature_3d(
             self,
             feat: FeatureState3D,
             y_observed: np.ndarray,
+            z_obs: float,
+            drive: float,
         ) -> None:
-        """EqF Riccati update with Equivariant Output Approximation.
+        """Sequential decoupled update: bearing IEKF + Vogiatzis depth.
 
-        Uses:
-            1. Equivariant output: H_avg = 0.5 * (H_pred + H_obs)
-            2. H_normal = H_euc @ conv_normal2euc (maps to Lie algebra)
-            3. Kalman gain K in Normal chart coordinates
-            4. point_chart_normal_inv (exponential map) to apply update
+        Two-step sequential update that separates the reliable 2D bearing
+        observation from the noisy 1D triangulated depth:
 
-        The equivariant output approximation (EqF paper, Section III)
-        evaluates the measurement Jacobian at both predicted and observed
-        bearings, then averages. This reduces 2nd-order linearization error.
+        Step 1 — Bearing update (standard IEKF, no mixture):
+            LK-tracked pixel coordinates are highly reliable (mostly
+            Gaussian noise), so we apply a standard Kalman update using
+            the 2×3 bearing Jacobian H_bearing.  This shrinks the two
+            bearing directions of the Normal chart covariance but leaves
+            the depth (index 2) almost untouched (H_bearing[:,2] ≈ 0).
+
+        Step 2 — Depth update (1D Vogiatzis mixture):
+            The triangulated depth z_obs is noisy with heavy-tailed
+            outliers, so we gate it through the scalar Vogiatzis
+            Gaussian-Beta mixture.  The observation is log(z_obs) with
+            Jacobian H_dep = [0, 0, -1] in Normal chart coords.  The
+            Kalman gain K_dep pulls from the full 3rd column of P_mid,
+            so depth updates also subtly adjust bearing via the cross-
+            covariance terms from Step 1.
+
+        This architecture:
+            - Fixes depth blindness (bearing obs carry zero depth info)
+            - Protects bearing from bad triangulations (ρ ≈ 0 → depth
+              update ignored, bearing track untouched)
+            - Uses the exact same 1D Vogiatzis math as the POLAR filter
+              for a/b tracking
         """
+        s = self.settings
         q = feat.position
         if np.linalg.norm(q) < 1e-4:
             return
+
+        # ==============================================================
+        # Step 1: Bearing update (standard IEKF)
+        # ==============================================================
+
+        # Measurement Jacobian (equivariant output approximation).
+        # y_observed is already undistorted to pinhole pixels by
+        # _undistort_uvs(), so convert to bearing with pinhole math
+        # (NOT cam_ptr.undistort_point, which would double-undistort).
+        fx, fy = self.K[0, 0], self.K[1, 1]
+        cx, cy = self.K[0, 2], self.K[1, 2]
 
         if self._cam_ptr is not None:
             q_pred = q / np.linalg.norm(q)
             H_pred = self._cam_ptr.projection_jacobian(q_pred)
 
-            y_obs_bearing = self._cam_ptr.undistort_point(y_observed)
+            y_obs_norm = np.array([
+                (y_observed[0] - cx) / fx,
+                (y_observed[1] - cy) / fy,
+                1.0,
+            ])
+            y_obs_bearing = y_obs_norm / np.linalg.norm(y_obs_norm)
             H_obs = self._cam_ptr.projection_jacobian(y_obs_bearing)
 
             H_euc = 0.5 * (H_pred + H_obs)
@@ -1032,7 +1067,6 @@ class SparseVogiatzisFilter3D(SparseVogiatzisFilter):
             depth = feat.depth
             if depth < 1e-4:
                 return
-            fx, fy = self.K[0, 0], self.K[1, 1]
             x, y, z = q[0], q[1], q[2]
             H_euc = np.zeros((2, 3))
             H_euc[0, 0] = fx / z
@@ -1041,43 +1075,170 @@ class SparseVogiatzisFilter3D(SparseVogiatzisFilter):
             H_euc[1, 2] = -fy * y / (z * z)
 
         M_norm2euc = conv_normal2euc(q)
-        H_normal = H_euc @ M_norm2euc
+        H_bearing = H_euc @ M_norm2euc  # (2, 3)
 
-        fx, fy = self.K[0, 0], self.K[1, 1]
-        cx, cy = self.K[0, 2], self.K[1, 2]
         y_pred = np.array([
             fx * q[0] / q[2] + cx,
             fy * q[1] / q[2] + cy,
         ])
 
-        R_obs = self._sigma_norm_sq * np.eye(2)
-        S = H_normal @ feat.covariance @ H_normal.T + R_obs
+        sigma_pixel_sq = s.sigma_pixel * s.sigma_pixel
+        R_bearing = sigma_pixel_sq * np.eye(2)
+        S_bearing = H_bearing @ feat.covariance @ H_bearing.T + R_bearing
 
         try:
-            S_inv = np.linalg.inv(S + 1e-8 * np.eye(2))
+            S_inv = np.linalg.inv(S_bearing + 1e-8 * np.eye(2))
         except np.linalg.LinAlgError:
             return
 
-        K = feat.covariance @ H_normal.T @ S_inv
+        K_bearing = feat.covariance @ H_bearing.T @ S_inv
+        inn_bearing = y_observed - y_pred
+        Delta_eps_bearing = K_bearing @ inn_bearing
 
-        innovation = y_observed - y_pred
-        Delta_eps = K @ innovation
+        lm_mid = point_chart_normal_inv(Delta_eps_bearing,
+                                        Landmark(p=q, id=feat.feat_id))
+        q_mid = lm_mid.p
 
-        lm_old = Landmark(p=q, id=feat.feat_id)
-        lm_new = point_chart_normal_inv(Delta_eps, lm_old)
+        I_KH = np.eye(3) - K_bearing @ H_bearing
+        P_mid = I_KH @ feat.covariance @ I_KH.T + K_bearing @ R_bearing @ K_bearing.T
 
-        I_KH = np.eye(3) - K @ H_normal
-        cov_new = I_KH @ feat.covariance @ I_KH.T + K @ R_obs @ K.T
-
-        eigvals = np.linalg.eigvalsh(cov_new)
+        # SPD guard.
+        eigvals = np.linalg.eigvalsh(P_mid)
         if np.any(eigvals <= 0):
-            cov_new = feat.covariance
-            q_new = q
+            P_mid = feat.covariance
+            q_mid = q
+
+        # ==============================================================
+        # Step 2: Depth update (1D Vogiatzis-gated)
+        # ==============================================================
+
+        z_mid = float(np.linalg.norm(q_mid))
+        if z_mid < s.min_depth:
+            feat.position = q_mid
+            feat.covariance = P_mid
+            return
+
+        # Observation in log-depth chart.
+        d_obs = math.log(z_obs)
+        d_pred = math.log(z_mid)
+        inn_depth = d_obs - d_pred
+
+        # H_dep = [0, 0, -1] in Normal chart (eps[2] = -log(z/z0)).
+        # S_dep = H_dep @ P_mid @ H_dep^T + tau_d^2
+        #       = P_mid[2,2] + tau_d^2
+        # tau_d^2 = z^2 * sigma_norm^2 / drive^2  (POLAR chart noise)
+        tau_d_sq = (z_obs * z_obs) * self._sigma_norm_sq / (drive * drive)
+        S_dep = P_mid[2, 2] + tau_d_sq
+
+        if S_dep < 1e-30:
+            feat.position = q_mid
+            feat.covariance = P_mid
+            return
+
+        maha_sq_dep = (inn_depth * inn_depth) / S_dep
+
+        # --- Vogiatzis Gaussian-Beta mixture (scalar, same as 1D) ---
+        a, b = feat.a, feat.b
+        ab = a + b
+
+        # Stuck-outlier reset.
+        if (
+            s.mahalanobis_reset_chi2 > 0.0
+            and ab > 0.0
+            and (a / ab) < s.min_inlier_ratio
+            and maha_sq_dep > s.mahalanobis_reset_chi2
+        ):
+            feat.position = self._position_from_depth(
+                y_observed, z_obs, s.init_depth_var,
+            )
+            feat.covariance = np.eye(3) * s.init_depth_var
+            feat.a = s.a_init
+            feat.b = s.b_init
+            return
+
+        # Gaussian evidence for the depth innovation.
+        exponent = -0.5 * maha_sq_dep
+        if exponent < -50.0:
+            gauss_pdf = 0.0
+        else:
+            gauss_pdf = math.exp(exponent) / math.sqrt(2.0 * math.pi * S_dep)
+
+        # Uniform prior: log-depth in [d_min, d_max].
+        U_prior = 1.0 / (s.uniform_d_max - s.uniform_d_min)
+
+        C1 = (a / ab) * gauss_pdf
+        C2 = (b / ab) * U_prior
+        Z_norm = C1 + C2
+
+        if Z_norm < 1e-30:
+            feat.b = min(b + 1.0, s.ab_max)
+            feat.position = q_mid
+            feat.covariance = P_mid
+            return
+
+        w1 = C1 / Z_norm
+        w2 = C2 / Z_norm
+
+        # Kalman gain for depth.
+        # K_dep = P_mid @ H_dep^T / S_dep = -P_mid[:, 2] / S_dep
+        K_dep = -P_mid[:, 2] / S_dep  # (3,)
+
+        # Weighted correction in Normal chart.
+        Delta_eps_depth = (w1 * inn_depth) * K_dep
+
+        lm_new = point_chart_normal_inv(Delta_eps_depth,
+                                        Landmark(p=q_mid, id=feat.feat_id))
+
+        # Inlier Kalman covariance: P_dep = (I - K_dep @ H_dep) @ P_mid
+        # H_dep = [0, 0, -1], so K_dep @ H_dep = -outer(K_dep, e2^T)...
+        # Actually: K_dep is (3,), H_dep is (1,3) = [0,0,-1].
+        # K_dep @ H_dep = K_dep.reshape(3,1) @ H_dep.reshape(1,3)
+        H_dep = np.array([[0.0, 0.0, -1.0]])
+        KH_dep = np.outer(K_dep, H_dep)
+        I_KH_dep = np.eye(3) - KH_dep
+        P_kalman = I_KH_dep @ P_mid @ I_KH_dep.T + (tau_d_sq * np.outer(K_dep, K_dep))
+
+        # Moment-matched covariance across inlier/outlier.
+        # Inlier component: correction = inn_depth * K_dep (full Δε)
+        full_dep_eps = inn_depth * K_dep
+        P_new = (
+            w1 * P_kalman
+            + w2 * P_mid
+            + w1 * w2 * np.outer(full_dep_eps, full_dep_eps)
+        )
+
+        eigvals = np.linalg.eigvalsh(P_new)
+        if np.any(eigvals <= 0):
+            P_new = P_mid
+            q_new = q_mid
         else:
             q_new = lm_new.p
 
         feat.position = q_new
-        feat.covariance = cov_new
+        feat.covariance = P_new
+
+        # --- Beta moment-matching for a/b ---
+        denom1 = ab + 1.0
+        denom2 = denom1 * (ab + 2.0)
+        E_pi = (w1 * (a + 1.0) + w2 * a) / denom1
+        E_pi2 = (
+            w1 * (a + 1.0) * (a + 2.0)
+            + w2 * a * (a + 1.0)
+        ) / denom2
+        v_pi = E_pi2 - E_pi * E_pi
+
+        if v_pi < 1e-6 or E_pi <= 1e-6 or E_pi >= 1.0 - 1e-6:
+            new_a = a + w1
+            new_b = b + w2
+        else:
+            factor = E_pi * (1.0 - E_pi) / v_pi - 1.0
+            if factor < 0.5:
+                factor = 0.5
+            new_a = E_pi * factor
+            new_b = (1.0 - E_pi) * factor
+
+        feat.a = float(np.clip(new_a, s.ab_min, s.ab_max))
+        feat.b = float(np.clip(new_b, s.ab_min, s.ab_max))
 
     def _observed_bearing(self, uv: np.ndarray) -> np.ndarray:
         """Convert pixel → normalized bearing vector."""

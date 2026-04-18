@@ -96,11 +96,11 @@ SparseVog:
   # Per-feature Vogiatzis filter.
   # parametrization: euclidean, invdepth, polar (1D scalar)
   #                   polar3d (3D Local IEKF on Normal chart)
-  parametrization: polar
+  parametrization: polar3d
   max_pool_size: 300
   min_track_length: 5
   conv_inlier_ratio: 0.7        # a/(a+b) gate for query()
-  conv_variance_threshold: 0.5  # var(z) gate for query()
+  conv_variance_threshold: 0.02 # var(z) gate for query()
   init_depth_var: 1.0
   sigma_pixel: 0.5              # pixel noise for obs tau^2 = z^4 * sigma^2 / drive^2
   uniform_z_max: 20.0           # outlier uniform density: 1/z_max
