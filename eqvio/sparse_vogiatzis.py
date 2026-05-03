@@ -317,8 +317,8 @@ class SparseVogiatzisFilter:
                     )
                     feat_btau = var_t / t_ref_nsq
 
-                init_obs, init_tau = self._obs_and_tau(z_obs, drive, None, feat_btau)
-                init_var = init_tau
+                rho_obs, tau_rho = self._obs_and_tau(z_obs, drive, None, feat_btau)
+                init_obs, init_var = self._rho_to_canonical(rho_obs, tau_rho)
                 if flowdep is not None:
                     fd_depth, fd_var = flowdep.query_depth(
                         float(uv_curr[0]), float(uv_curr[1]),
@@ -369,19 +369,20 @@ class SparseVogiatzisFilter:
 
             if not math.isfinite(feat.canonical):
                 # Prediction invalidated — reset from obs + fresh reference.
-                init_obs, init_tau = self._obs_and_tau(z_obs, drive, None, feat_btau)
-                feat.canonical = init_obs
-                feat.canonical_var = init_tau
+                rho_obs, tau_rho = self._obs_and_tau(z_obs, drive, None, feat_btau)
+                c_init, v_init = self._rho_to_canonical(rho_obs, tau_rho)
+                feat.canonical = c_init
+                feat.canonical_var = v_init
                 feat.a = self.settings.a_init
                 feat.b = self.settings.b_init
                 feat.ref_T_WC = T_WC.copy()
                 feat.ref_uv = uv_curr.copy()
                 feat.ref_stamp = stamp
-                obs, tau_sq = self._obs_and_tau(z_obs, drive, feat, feat_btau)
-                self._vogiatzis_update(feat, obs, tau_sq)
+                rho_obs2, tau_rho2 = self._obs_and_tau(z_obs, drive, feat, feat_btau)
+                self._vogiatzis_update(feat, rho_obs2, tau_rho2)
             elif flow_px >= self.settings.reanchor_flow_px:
-                obs, tau_sq = self._obs_and_tau(z_obs, drive, feat, feat_btau)
-                self._vogiatzis_update(feat, obs, tau_sq)
+                rho_obs, tau_rho = self._obs_and_tau(z_obs, drive, feat, feat_btau)
+                self._vogiatzis_update(feat, rho_obs, tau_rho)
                 feat.ref_T_WC = T_WC.copy()
                 feat.ref_uv = uv_curr.copy()
                 feat.ref_stamp = stamp
@@ -413,22 +414,35 @@ class SparseVogiatzisFilter:
         feat: FeatureState,
         baseline_tau_sq: float = 0.0,
     ) -> tuple[float, float]:
-        """Return (canonical_observation, tau_sq) for the active parametrization.
+        """Return (rho_obs, tau_rho) — always in InvDepth space.
 
-        baseline_tau_sq = var(||t||) / ||t||² inflates tau when the
-        triangulation baseline is uncertain (improvement 1).
+        Triangulation produces 1/z linearly in pixel noise, so rho_obs
+        is an unbiased observation.  The Vogiatzis update uses a Jacobian
+        H = d(rho)/d(canonical) to map into the canonical state space.
         """
         pixel_tau_sq = self._sigma_norm_sq / (drive * drive)
+        rho_obs = 1.0 / z_obs
+        if rho_obs < 0.0 or not math.isfinite(rho_obs):
+            return -1.0, 0.0
+        tau_rho = pixel_tau_sq + rho_obs * rho_obs * baseline_tau_sq
+        return rho_obs, tau_rho
+
+    def _rho_to_canonical(
+        self,
+        rho: float,
+        rho_var: float,
+    ) -> tuple[float, float]:
+        """Convert (rho, var_rho) to (canonical, var_canonical)."""
         if self._param is DepthParametrization.INVDEPTH:
-            rho_obs = 1.0 / z_obs
-            if rho_obs < 0.0 or not math.isfinite(rho_obs):
-                return -1.0, 0.0
-            return rho_obs, pixel_tau_sq + rho_obs * rho_obs * baseline_tau_sq
-        elif self._param is DepthParametrization.POLAR:
-            d_obs = -math.log(z_obs)
-            return d_obs, z_obs * z_obs * pixel_tau_sq + baseline_tau_sq
+            return rho, rho_var
+        z = 1.0 / rho
+        if self._param is DepthParametrization.POLAR:
+            d = -math.log(z)
+            # d(d)/d(rho) = d(-log(1/rho))/d(rho) = 1/rho
+            return d, rho_var / (rho * rho)
         else:
-            return z_obs, (z_obs ** 4) * pixel_tau_sq + z_obs * z_obs * baseline_tau_sq
+            # d(z)/d(rho) = -1/rho²
+            return z, rho_var / (rho ** 4)
 
     def _canonical_from_depth(
         self,
@@ -667,21 +681,71 @@ class SparseVogiatzisFilter:
     # Vogiatzis moment-matched update (scalar)
     # ------------------------------------------------------------------
 
+    def _rho_jacobian(self, mu: float) -> float:
+        """H = d(rho)/d(canonical) at current estimate mu."""
+        if self._param is DepthParametrization.INVDEPTH:
+            return 1.0
+        elif self._param is DepthParametrization.POLAR:
+            # rho = exp(d), d(rho)/d(d) = exp(d)
+            return math.exp(mu)
+        else:
+            # rho = 1/z, d(rho)/d(z) = -1/z²
+            if abs(mu) < 1e-12:
+                return -1e24
+            return -1.0 / (mu * mu)
+
+    def _rho_from_canonical(self, mu: float) -> float:
+        """Predicted rho = 1/z from canonical state."""
+        if self._param is DepthParametrization.INVDEPTH:
+            return mu
+        elif self._param is DepthParametrization.POLAR:
+            return math.exp(mu)
+        else:
+            if abs(mu) < 1e-12:
+                return 1e12
+            return 1.0 / mu
+
     def _vogiatzis_update(
         self,
         feat: FeatureState,
-        obs: float,
-        tau_sq: float,
+        rho_obs: float,
+        tau_rho: float,
     ) -> None:
-        """1D Gaussian-Beta mixture update, matching FlowDep._vogiatzis_update."""
+        """1D Gaussian-Beta mixture update with indirect rho-space observation.
+
+        Observation is always rho_obs (unbiased).  For non-InvDepth
+        parametrizations, uses IEKF (iterated EKF) to handle the
+        nonlinear h(canonical) → rho mapping.
+        """
         s = self.settings
         mu = feat.canonical
         sigma_sq = feat.canonical_var
         a = feat.a
         b = feat.b
 
-        s_total = sigma_sq + tau_sq
-        diff = obs - mu
+        # IEKF: iterate linearization point for inlier Kalman branch.
+        m_iter = mu
+        for _ in range(3):
+            H_i = self._rho_jacobian(m_iter)
+            H2_i = H_i * H_i
+            s_i = H2_i * sigma_sq + tau_rho
+            K_i = sigma_sq * H_i / s_i
+            rho_pred_i = self._rho_from_canonical(m_iter)
+            innov_i = rho_obs - rho_pred_i - H_i * (mu - m_iter)
+            m_iter = mu + K_i * innov_i
+
+        H = self._rho_jacobian(m_iter)
+        H2 = H * H
+        s_total = H2 * sigma_sq + tau_rho
+        K = sigma_sq * H / s_total
+        rho_pred = self._rho_from_canonical(m_iter)
+        diff = rho_obs - rho_pred - H * (mu - m_iter)
+        m = mu + K * diff
+        s_sq = sigma_sq * (1.0 - K * H)
+        if s_sq < 1e-8:
+            s_sq = 1e-8
+
+        # Mahalanobis distance for gating (use final linearization).
         m_dist_sq = (diff * diff) / s_total
 
         # Stuck-outlier recovery.
@@ -692,33 +756,30 @@ class SparseVogiatzisFilter:
             and (a / ab_pre) < s.min_inlier_ratio
             and m_dist_sq > s.mahalanobis_reset_chi2
         ):
-            feat.canonical = obs
-            feat.canonical_var = tau_sq
+            z_reset = 1.0 / rho_obs
+            if self._param is DepthParametrization.INVDEPTH:
+                feat.canonical = rho_obs
+                feat.canonical_var = tau_rho
+            elif self._param is DepthParametrization.POLAR:
+                feat.canonical = -math.log(z_reset)
+                H_r = self._rho_jacobian(feat.canonical)
+                feat.canonical_var = tau_rho / (H_r * H_r) if abs(H_r) > 1e-30 else tau_rho
+            else:
+                feat.canonical = z_reset
+                feat.canonical_var = z_reset ** 4 * tau_rho
             feat.a = s.a_init
             feat.b = s.b_init
             return
 
-        # Inlier Kalman branch.
-        m = (mu * tau_sq + obs * sigma_sq) / s_total
-        s_sq = sigma_sq * tau_sq / s_total
-
-        # Gaussian evidence.
+        # Gaussian evidence (in rho-space, final linearization).
         exponent = -0.5 * m_dist_sq
         if exponent < -50.0:
             gauss_pdf = 0.0
         else:
             gauss_pdf = math.exp(exponent) / math.sqrt(2.0 * math.pi * s_total)
 
-        # Uniform prior over the canonical interval.
-        # EUCLIDEAN: z in [0, uniform_z_max]
-        # INVDEPTH:  rho in [0, uniform_rho_max]
-        # POLAR:     d in [uniform_d_min, uniform_d_max]
-        if self._param is DepthParametrization.INVDEPTH:
-            U_prior = 1.0 / s.uniform_rho_max
-        elif self._param is DepthParametrization.POLAR:
-            U_prior = 1.0 / (s.uniform_d_max - s.uniform_d_min)
-        else:
-            U_prior = 1.0 / s.uniform_z_max
+        # Uniform outlier prior over rho (observation space).
+        U_prior = 1.0 / s.uniform_rho_max
         ab_sum = a + b
         C1 = (a / ab_sum) * gauss_pdf
         C2 = (b / ab_sum) * U_prior
