@@ -16,7 +16,8 @@ Canonical chart is configurable via DepthParametrization:
                   the nonlinearity, giving more uniform convergence across
                   depth range. Matching FlowDep's default.)
                   uniform prior: rho in [0, uniform_rho_max]
-    - POLAR      : d = log(z) (dimensionless)
+    - POLAR      : d = -log(z) = log(ρ) (dimensionless, consistent with
+                  InvDepth and Normal chart)
                   tau_sq = z^2 * sigma_norm^2 / drive^2
                   uniform prior: d in [uniform_d_min, uniform_d_max]
 
@@ -26,7 +27,7 @@ Jacobian.
 
 Per-feature Vogiatzis update follows the same moment-matched Gaussian-Beta
 math as FlowDep._vogiatzis_update, specialised to scalar depth:
-    mu          canonical depth (z, rho, or log_z)
+    mu          canonical depth (z, rho, or -log_z)
     sigma_sq    var(canonical)
     a, b        Beta shape of inlier prob pi
 """
@@ -60,6 +61,15 @@ class DepthParametrization(Enum):
     INVDEPTH = auto()
     POLAR = auto()
     POLAR3D = auto()  # 3D Local IEKF on Normal chart
+
+
+def _skew(v: np.ndarray) -> np.ndarray:
+    """3×3 skew-symmetric matrix [v]×."""
+    return np.array([
+        [0, -v[2], v[1]],
+        [v[2], 0, -v[0]],
+        [-v[1], v[0], 0],
+    ])
 
 
 # ============================================================================
@@ -96,8 +106,8 @@ class SparseVogSettings:
     a_init: float = 10.0
     b_init: float = 2.0
     ab_min: float = 1.0
-    ab_max: float = 20.0
-    min_inlier_ratio: float = 0.5  # also used for reset gating
+    ab_max: float = 100.0
+    min_inlier_ratio: float = 0.3  # also used for reset gating
     mahalanobis_reset_chi2: float = 9.0
 
     # --- Process model ---
@@ -108,6 +118,7 @@ class SparseVogSettings:
     min_cos_sim: float = 0.95    # reject pixel motion misaligned with epipolar
     min_depth: float = 0.1
     max_depth: float = 100.0
+    reanchor_flow_px: float = 3.0  # derotated flow (px) before update+re-anchor
 
 
 # ============================================================================
@@ -116,13 +127,16 @@ class SparseVogSettings:
 
 @dataclass
 class FeatureState:
-    """One tracked feature's scalar Vogiatzis belief (canonical: z, rho, or log_z)."""
+    """One tracked feature's scalar Vogiatzis belief (canonical: z, rho, or -log_z)."""
     feat_id: int
-    canonical: float = -1.0      # z (EUCLIDEAN), rho=1/z (INVDEPTH), or log_z (POLAR)
+    canonical: float = float('nan')  # z (EUCLIDEAN), rho=1/z (INVDEPTH), or -log(z) (POLAR)
     canonical_var: float = 1.0
     a: float = 10.0
     b: float = 2.0
     track_length: int = 0
+    ref_T_WC: Optional[np.ndarray] = None   # reference frame pose (for triangulation)
+    ref_uv: Optional[np.ndarray] = None     # reference frame pixel position
+    ref_stamp: float = -1.0
 
     @property
     def depth(self) -> float:
@@ -175,6 +189,7 @@ class SparseVogiatzisFilter:
         )
 
         self._features: Dict[int, FeatureState] = {}
+        self._pending: Dict[int, tuple[np.ndarray, np.ndarray, float]] = {}
         self._prev_uvs: Dict[int, np.ndarray] = {}
         self._prev_T_WC: Optional[np.ndarray] = None
         self._prev_stamp: float = -1.0
@@ -206,14 +221,22 @@ class SparseVogiatzisFilter:
         T_WC: np.ndarray,
         P_vv: Optional[np.ndarray] = None,
         flowdep=None,
+        v_C: Optional[np.ndarray] = None,
     ) -> None:
         """Propagate + update each tracked feature's depth belief.
 
         Parameters
         ----------
+        P_vv : (3,3) or (6,6) array, optional
+            Velocity covariance.  3×3 = translational only.
+            6×6 = full spatial velocity [ω; v] (improvement 2).
         flowdep : optional FlowDepFilter
             When provided, new features are seeded with FlowDep's dense
             depth estimate instead of the first triangulation.
+        v_C : (3,) array, optional
+            EqF-filtered camera velocity in camera frame.  When provided,
+            the cos_sim epipolar gate uses this instead of frame-to-frame
+            t for a more stable direction (improvement 3).
         """
         stamp = measurement.stamp
         curr_uvs = {
@@ -242,28 +265,60 @@ class SparseVogiatzisFilter:
         R = T_curr_prev[:3, :3]
         t = T_curr_prev[:3, 3]
 
+        # Baseline uncertainty for τ² inflation (improvement 1).
+        P_vv_trans = None
+        if P_vv is not None:
+            P_vv_trans = P_vv[3:6, 3:6] if P_vv.shape == (6, 6) else P_vv
+        t_norm_sq = float(t[0] ** 2 + t[1] ** 2 + t[2] ** 2)
+        baseline_tau_sq = 0.0
+        if P_vv_trans is not None and t_norm_sq > 1e-16 and dt > 0:
+            t_hat = t / math.sqrt(t_norm_sq)
+            var_t_mag = dt * dt * float(t_hat @ P_vv_trans @ t_hat)
+            baseline_tau_sq = var_t_mag / t_norm_sq
+
         for fid, uv_curr in curr_uvs.items():
             uv_prev = self._prev_uvs.get(fid)
             if uv_prev is None:
-                # Feature not seen last frame — wait a frame for a baseline.
                 continue
 
-            z_obs, drive = self._triangulate(uv_prev, uv_curr, R, t)
-
-            # Predict existing feature to the current frame regardless of
-            # whether triangulation gave us a fresh observation.
             feat = self._features.get(fid)
-            if feat is not None and feat.canonical > 0:
-                self._predict_feature(feat, uv_prev, R, t, P_vv, dt)
 
-            if z_obs <= 0.0:
-                continue
-
-            # Initialise new feature: FlowDep seed > first triangulation.
+            # --- Pending features: coast until flow gate is met ---
             if feat is None:
-                if len(self._features) >= self.settings.max_pool_size:
+                pending = self._pending.get(fid)
+                if pending is None:
+                    if len(self._features) + len(self._pending) < self.settings.max_pool_size:
+                        self._pending[fid] = (
+                            self._prev_T_WC.copy(), uv_prev.copy(),
+                            self._prev_stamp,
+                        )
                     continue
-                init_obs, init_var = self._canonical_from_depth(z_obs, self.settings.init_depth_var)
+
+                ref_T, ref_uv, ref_stamp = pending
+                T_curr_ref = T_CW_curr @ ref_T
+                R_ref = T_curr_ref[:3, :3]
+                t_ref = T_curr_ref[:3, 3]
+                z_obs, drive = self._triangulate(
+                    ref_uv, uv_curr, R_ref, t_ref, v_C,
+                )
+                if z_obs <= 0.0:
+                    continue
+                flow_px = drive * float(self.K[0, 0])
+                if flow_px < self.settings.reanchor_flow_px:
+                    continue
+
+                t_ref_nsq = float(t_ref[0] ** 2 + t_ref[1] ** 2 + t_ref[2] ** 2)
+                feat_btau = 0.0
+                if P_vv_trans is not None and t_ref_nsq > 1e-16 and dt > 0:
+                    t_ref_hat = t_ref / math.sqrt(t_ref_nsq)
+                    dt_total = max(stamp - ref_stamp, dt)
+                    var_t = dt_total * dt * float(
+                        t_ref_hat @ P_vv_trans @ t_ref_hat
+                    )
+                    feat_btau = var_t / t_ref_nsq
+
+                init_obs, init_tau = self._obs_and_tau(z_obs, drive, None, feat_btau)
+                init_var = init_tau
                 if flowdep is not None:
                     fd_depth, fd_var = flowdep.query_depth(
                         float(uv_curr[0]), float(uv_curr[1]),
@@ -276,30 +331,72 @@ class SparseVogiatzisFilter:
                     canonical_var=init_var,
                     a=self.settings.a_init,
                     b=self.settings.b_init,
+                    ref_T_WC=T_WC.copy(),
+                    ref_uv=uv_curr.copy(),
+                    ref_stamp=stamp,
                 )
                 self._features[fid] = feat
-                # Apply first observation immediately (same as EUCLIDEAN behaviour).
-                obs, tau_sq = self._obs_and_tau(z_obs, drive, feat)
-                self._vogiatzis_update(feat, obs, tau_sq)
-            elif feat.canonical <= 0:
-                # Prediction invalidated it — reset from obs.
-                init_obs, init_var = self._canonical_from_depth(z_obs, self.settings.init_depth_var)
+                del self._pending[fid]
+                feat.track_length += 1
+                continue
+
+            # --- Existing features ---
+            # Triangulate from reference frame (growing baseline).
+            T_curr_ref = T_CW_curr @ feat.ref_T_WC
+            R_ref = T_curr_ref[:3, :3]
+            t_ref = T_curr_ref[:3, 3]
+            z_obs, drive = self._triangulate(
+                feat.ref_uv, uv_curr, R_ref, t_ref, v_C,
+            )
+            t_ref_nsq = float(t_ref[0] ** 2 + t_ref[1] ** 2 + t_ref[2] ** 2)
+            feat_btau = 0.0
+            if P_vv_trans is not None and t_ref_nsq > 1e-16 and dt > 0:
+                t_ref_hat = t_ref / math.sqrt(t_ref_nsq)
+                dt_total = max(stamp - feat.ref_stamp, dt)
+                var_t = dt_total * dt * float(
+                    t_ref_hat @ P_vv_trans @ t_ref_hat
+                )
+                feat_btau = var_t / t_ref_nsq
+
+            # Predict using frame-to-frame pose (independent of observation).
+            if math.isfinite(feat.canonical):
+                self._predict_feature(feat, uv_prev, R, t, P_vv, dt)
+
+            if z_obs <= 0.0:
+                continue
+
+            flow_px = drive * float(self.K[0, 0])
+
+            if not math.isfinite(feat.canonical):
+                # Prediction invalidated — reset from obs + fresh reference.
+                init_obs, init_tau = self._obs_and_tau(z_obs, drive, None, feat_btau)
                 feat.canonical = init_obs
-                feat.canonical_var = init_var
+                feat.canonical_var = init_tau
                 feat.a = self.settings.a_init
                 feat.b = self.settings.b_init
-                obs, tau_sq = self._obs_and_tau(z_obs, drive, feat)
+                feat.ref_T_WC = T_WC.copy()
+                feat.ref_uv = uv_curr.copy()
+                feat.ref_stamp = stamp
+                obs, tau_sq = self._obs_and_tau(z_obs, drive, feat, feat_btau)
                 self._vogiatzis_update(feat, obs, tau_sq)
+            elif flow_px >= self.settings.reanchor_flow_px:
+                obs, tau_sq = self._obs_and_tau(z_obs, drive, feat, feat_btau)
+                self._vogiatzis_update(feat, obs, tau_sq)
+                feat.ref_T_WC = T_WC.copy()
+                feat.ref_uv = uv_curr.copy()
+                feat.ref_stamp = stamp
             else:
-                obs, tau_sq = self._obs_and_tau(z_obs, drive, feat)
-                self._vogiatzis_update(feat, obs, tau_sq)
+                continue
 
             feat.track_length += 1
 
-        # Drop features no longer tracked by LK.
+        # Drop features and pending entries no longer tracked by LK.
         lost = set(self._features.keys()) - set(curr_uvs.keys())
         for fid in lost:
             del self._features[fid]
+        lost_pending = set(self._pending.keys()) - set(curr_uvs.keys())
+        for fid in lost_pending:
+            del self._pending[fid]
 
         self._prev_T_WC = T_WC.copy()
         self._prev_stamp = stamp
@@ -314,18 +411,24 @@ class SparseVogiatzisFilter:
         z_obs: float,
         drive: float,
         feat: FeatureState,
+        baseline_tau_sq: float = 0.0,
     ) -> tuple[float, float]:
-        """Return (canonical_observation, tau_sq) for the active parametrization."""
+        """Return (canonical_observation, tau_sq) for the active parametrization.
+
+        baseline_tau_sq = var(||t||) / ||t||² inflates tau when the
+        triangulation baseline is uncertain (improvement 1).
+        """
+        pixel_tau_sq = self._sigma_norm_sq / (drive * drive)
         if self._param is DepthParametrization.INVDEPTH:
             rho_obs = 1.0 / z_obs
             if rho_obs < 0.0 or not math.isfinite(rho_obs):
                 return -1.0, 0.0
-            return rho_obs, self._sigma_norm_sq / (drive * drive)
+            return rho_obs, pixel_tau_sq + rho_obs * rho_obs * baseline_tau_sq
         elif self._param is DepthParametrization.POLAR:
-            d_obs = math.log(z_obs)
-            return d_obs, (z_obs * z_obs) * self._sigma_norm_sq / (drive * drive)
+            d_obs = -math.log(z_obs)
+            return d_obs, z_obs * z_obs * pixel_tau_sq + baseline_tau_sq
         else:
-            return z_obs, (z_obs ** 4) * self._sigma_norm_sq / (drive * drive)
+            return z_obs, (z_obs ** 4) * pixel_tau_sq + z_obs * z_obs * baseline_tau_sq
 
     def _canonical_from_depth(
         self,
@@ -336,7 +439,7 @@ class SparseVogiatzisFilter:
 
         Jacobian: ∂canonical/∂z
         - INVDEPTH: ρ = 1/z → ∂ρ/∂z = -1/z² → var(ρ) = var(z) / z⁴
-        - POLAR:    d = log(z) → ∂d/∂z = 1/z  → var(d) = var(z) / z²
+        - POLAR:    d = -log(z) → ∂d/∂z = -1/z → var(d) = var(z) / z²
         - EUCLIDEAN: var(z) = var(z)
         """
         if self._param is DepthParametrization.INVDEPTH:
@@ -344,7 +447,7 @@ class SparseVogiatzisFilter:
             rho_var = euclidean_var / (z ** 4)
             return rho, rho_var
         elif self._param is DepthParametrization.POLAR:
-            d = math.log(z)
+            d = -math.log(z)
             d_var = euclidean_var / (z * z)
             return d, d_var
         else:
@@ -355,7 +458,7 @@ class SparseVogiatzisFilter:
         if self._param is DepthParametrization.INVDEPTH:
             return 1.0 / canonical
         elif self._param is DepthParametrization.POLAR:
-            return math.exp(canonical)
+            return math.exp(-canonical)
         else:
             return canonical
 
@@ -369,7 +472,7 @@ class SparseVogiatzisFilter:
 
         Jacobian: ∂z/∂canonical
         - INVDEPTH: z = 1/ρ → ∂z/∂ρ = -z² → var(z) = z⁴ · var(ρ)
-        - POLAR:    z = exp(d) → ∂z/∂d = z   → var(z) = z² · var(d)
+        - POLAR:    z = exp(-d) → ∂z/∂d = -z  → var(z) = z² · var(d)
         - EUCLIDEAN: var(z) = var(z)
         """
         if self._param is DepthParametrization.INVDEPTH:
@@ -389,10 +492,16 @@ class SparseVogiatzisFilter:
         uv_curr: np.ndarray,
         R: np.ndarray,
         t: np.ndarray,
+        v_C: Optional[np.ndarray] = None,
     ) -> tuple[float, float]:
         """Derotated epipolar triangulation for a single pixel pair.
 
         Returns (z_curr, ideal_parallax_mag). z_curr <= 0 on failure.
+
+        When v_C (EqF-filtered camera velocity in camera frame) is
+        provided, the cos_sim direction gate uses -v_C instead of t,
+        giving a more stable epipolar direction at low speed or high
+        rotation rate (improvement 3).
         """
         s = self.settings
         fx, fy = self.K[0, 0], self.K[1, 1]
@@ -423,13 +532,30 @@ class SparseVogiatzisFilter:
         if ideal_mag < s.min_parallax or obs_mag < 1e-6:
             return -1.0, 0.0
 
-        dot = num_x * den_x + num_y * den_y
-        if dot <= 1e-6:
+        # Epipolar direction for cos_sim gate: use v_C if available.
+        gate_x, gate_y = num_x, num_y
+        gate_mag = ideal_mag
+        if v_C is not None:
+            v_norm = math.sqrt(v_C[0] ** 2 + v_C[1] ** 2 + v_C[2] ** 2)
+            if v_norm > 1e-6:
+                vd = -v_C
+                gx = x_prev_rect * vd[2] - vd[0]
+                gy = y_prev_rect * vd[2] - vd[1]
+                gm = math.sqrt(gx * gx + gy * gy)
+                if gm > 1e-6:
+                    gate_x, gate_y, gate_mag = gx, gy, gm
+
+        dot_gate = gate_x * den_x + gate_y * den_y
+        if dot_gate <= 1e-6:
             return -1.0, 0.0
-        cos_sim = dot / (ideal_mag * obs_mag)
+        cos_sim = dot_gate / (gate_mag * obs_mag)
         if cos_sim < s.min_cos_sim:
             return -1.0, 0.0
 
+        # Depth from original t-based geometry (not the gating direction).
+        dot = num_x * den_x + num_y * den_y
+        if dot <= 1e-6:
+            return -1.0, 0.0
         z_curr = geom_mag_sq / dot
         if z_curr < s.min_depth or z_curr > s.max_depth:
             return -1.0, 0.0
@@ -466,7 +592,7 @@ class SparseVogiatzisFilter:
             z_old = 1.0 / rho_old
             p_prev = np.array([x / rho_old, y / rho_old, 1.0 / rho_old])
         elif self._param is DepthParametrization.POLAR:
-            z_old = math.exp(feat.canonical)
+            z_old = math.exp(-feat.canonical)
             p_prev = np.array([x * z_old, y * z_old, z_old])
         else:
             z_old = feat.canonical
@@ -475,7 +601,7 @@ class SparseVogiatzisFilter:
         p_curr = R @ p_prev + t
         z_new = p_curr[2]
         if z_new < s.min_depth:
-            feat.canonical = -1.0
+            feat.canonical = float('nan')
             return
 
         # g = R[2,:] @ bearing = R[2,0]*x + R[2,1]*y + R[2,2]
@@ -493,24 +619,31 @@ class SparseVogiatzisFilter:
             J = g
         var_new = (J * J) * feat.canonical_var
 
-        # Process noise: physical depth variance Q_Z = dt^2 * sigma_v_along.
-        # Must be mapped into the canonical chart via squared Jacobian of the chart.
-        # EUCLIDEAN:  Q = Q_Z
-        # INVDEPTH:   Q = Q_Z * rho^4 = Q_Z / Z^4   (J = -rho^2 for rho = 1/Z)
-        # POLAR:      Q = Q_Z / Z^2                 (J = 1/Z for d = log Z)
+        # Process noise: physical depth variance Q_Z mapped into canonical chart.
+        # When P_vv is 6×6 [ω; v], use the full depth-rate Jacobian
+        #   J_ż = [Z·y, -Z·x, 0, 0, 0, -1]  (improvement 2).
+        # When P_vv is 3×3, fall back to bearing-projected velocity variance.
         if P_vv is not None and dt > 0.0:
-            bx, by = x, y
-            b_norm_sq = bx * bx + by * by + 1.0
-            num = (
-                bx * bx * P_vv[0, 0]
-                + by * by * P_vv[1, 1]
-                + P_vv[2, 2]
-                + 2.0 * bx * by * P_vv[0, 1]
-                + 2.0 * bx * P_vv[0, 2]
-                + 2.0 * by * P_vv[1, 2]
-            )
-            sigma_v_along = num / b_norm_sq
-            Q_Z = dt * dt * sigma_v_along
+            if P_vv.shape == (6, 6):
+                x_n = p_curr[0] / z_new
+                y_n = p_curr[1] / z_new
+                J_zdot = np.array([
+                    z_new * y_n, -z_new * x_n, 0.0,
+                    0.0, 0.0, -1.0,
+                ])
+                Q_Z = dt * dt * float(J_zdot @ P_vv @ J_zdot)
+            else:
+                bx, by = x, y
+                b_norm_sq = bx * bx + by * by + 1.0
+                num = (
+                    bx * bx * P_vv[0, 0]
+                    + by * by * P_vv[1, 1]
+                    + P_vv[2, 2]
+                    + 2.0 * bx * by * P_vv[0, 1]
+                    + 2.0 * bx * P_vv[0, 2]
+                    + 2.0 * by * P_vv[1, 2]
+                )
+                Q_Z = dt * dt * num / b_norm_sq
             if self._param is DepthParametrization.INVDEPTH:
                 rho_new = 1.0 / z_new
                 var_new += Q_Z * (rho_new ** 4)
@@ -525,7 +658,7 @@ class SparseVogiatzisFilter:
         if self._param is DepthParametrization.INVDEPTH:
             feat.canonical = 1.0 / z_new
         elif self._param is DepthParametrization.POLAR:
-            feat.canonical = math.log(z_new)
+            feat.canonical = -math.log(z_new)
         else:
             feat.canonical = z_new
         feat.canonical_var = float(max(var_new, 1e-8))
@@ -641,7 +774,7 @@ class SparseVogiatzisFilter:
         Consumers receive Euclidean depth regardless of canonical chart.
         """
         feat = self._features.get(feat_id)
-        if feat is None or feat.canonical <= 0.0:
+        if feat is None or not math.isfinite(feat.canonical):
             return -1.0, float("inf")
         if feat.track_length < self.settings.min_track_length:
             return -1.0, float("inf")
@@ -694,7 +827,7 @@ class SparseVogiatzisFilter:
         positions: Dict[int, np.ndarray] = {}
         for fid, uv in self._prev_uvs.items():
             feat = self._features.get(fid)
-            if feat is None or feat.canonical <= 0.0:
+            if feat is None or not math.isfinite(feat.canonical):
                 continue
             if feat.track_length < s.min_track_length:
                 continue
@@ -726,7 +859,7 @@ class SparseVogiatzisFilter:
         s = self.settings
         n = 0
         for feat in self._features.values():
-            if feat.canonical <= 0 or feat.track_length < s.min_track_length:
+            if not math.isfinite(feat.canonical) or feat.track_length < s.min_track_length:
                 continue
             ab = feat.a + feat.b
             if ab <= 0.0 or (feat.a / ab) < s.conv_inlier_ratio:
@@ -749,9 +882,9 @@ class FeatureState3D:
     State: landmark position q ∈ ℝ³ (camera frame)
     Covariance: Σ ∈ 𝕊₊(3) tracked in Normal chart coordinates
 
-    The Normal chart parameterizes state as [sphere_bearing(2), log_depth]:
+    The Normal chart parameterizes state as [sphere_bearing(2), log_invdepth]:
         - Indices 0,1: bearing on S^2 (invariant to scale)
-        - Index 2: log(depth) = -log(||q||)
+        - Index 2: log(ρ/ρ₀) = -log(z/z₀), where ρ=1/z is inverse depth
 
     Using the Normal chart guarantees scale-equivariance and prevents
     negative depth (unlike Euclidean EKF).
@@ -782,6 +915,9 @@ class FeatureState3D:
     a: float = 10.0
     b: float = 2.0
     track_length: int = 0
+    ref_T_WC: Optional[np.ndarray] = None
+    ref_uv: Optional[np.ndarray] = None
+    ref_stamp: float = -1.0
 
     @property
     def depth(self) -> float:
@@ -791,8 +927,8 @@ class FeatureState3D:
     def depth_var(self) -> float:
         """Extract depth variance from Normal chart covariance.
 
-        Covariance is tracked in Normal coords where index 2 is log-depth.
-        Transform: var(z) = z^2 * var(log_z)
+        Index 2 is log(ρ) = -log(z).  Since var(-log z) = var(log z),
+        the transform is: var(z) = z² · cov[2,2]
         """
         if self.depth < 1e-6:
             return float("inf")
@@ -859,6 +995,7 @@ class SparseVogiatzisFilter3D(SparseVogiatzisFilter):
         T_WC: np.ndarray,
         P_vv: Optional[np.ndarray] = None,
         flowdep=None,
+        v_C: Optional[np.ndarray] = None,
     ) -> None:
         """Propagate + update each tracked 3D feature's belief.
 
@@ -891,52 +1028,130 @@ class SparseVogiatzisFilter3D(SparseVogiatzisFilter):
         R = T_curr_prev[:3, :3]
         t = T_curr_prev[:3, 3]
 
+        # Baseline uncertainty (improvement 1).
+        P_vv_trans = None
+        if P_vv is not None:
+            P_vv_trans = P_vv[3:6, 3:6] if P_vv.shape == (6, 6) else P_vv
+        t_norm_sq = float(t[0] ** 2 + t[1] ** 2 + t[2] ** 2)
+        baseline_tau_sq = 0.0
+        if P_vv_trans is not None and t_norm_sq > 1e-16 and dt > 0:
+            t_hat = t / math.sqrt(t_norm_sq)
+            var_t_mag = dt * dt * float(t_hat @ P_vv_trans @ t_hat)
+            baseline_tau_sq = var_t_mag / t_norm_sq
+
         for fid, uv_curr in curr_uvs.items():
             uv_prev = self._prev_uvs.get(fid)
             if uv_prev is None:
                 continue
 
-            z_obs, drive = self._triangulate(uv_prev, uv_curr, R, t)
-
             feat = self._features3d.get(fid)
-            if feat is not None and feat.depth > 0:
-                self._predict_feature_3d(feat, R, t, P_vv, dt)
 
-            if z_obs <= 0.0:
-                continue
-
+            # --- Pending features: coast until flow gate is met ---
             if feat is None:
-                if len(self._features3d) >= self.settings.max_pool_size:
+                pending = self._pending.get(fid)
+                if pending is None:
+                    if len(self._features3d) + len(self._pending) < self.settings.max_pool_size:
+                        self._pending[fid] = (
+                            self._prev_T_WC.copy(), uv_prev.copy(),
+                            self._prev_stamp,
+                        )
                     continue
+
+                ref_T, ref_uv, ref_stamp = pending
+                T_curr_ref = T_CW_curr @ ref_T
+                R_ref = T_curr_ref[:3, :3]
+                t_ref = T_curr_ref[:3, 3]
+                z_obs, drive = self._triangulate(
+                    ref_uv, uv_curr, R_ref, t_ref, v_C,
+                )
+                if z_obs <= 0.0:
+                    continue
+                flow_px = drive * float(self.K[0, 0])
+                if flow_px < self.settings.reanchor_flow_px:
+                    continue
+
+                t_ref_nsq = float(t_ref[0] ** 2 + t_ref[1] ** 2 + t_ref[2] ** 2)
+                feat_btau = 0.0
+                if P_vv_trans is not None and t_ref_nsq > 1e-16 and dt > 0:
+                    t_ref_hat = t_ref / math.sqrt(t_ref_nsq)
+                    dt_total = max(stamp - ref_stamp, dt)
+                    var_t = dt_total * dt * float(
+                        t_ref_hat @ P_vv_trans @ t_ref_hat
+                    )
+                    feat_btau = var_t / t_ref_nsq
+
                 init_pos = self._position_from_depth(
                     uv_curr, z_obs, self.settings.init_depth_var
                 )
                 feat = FeatureState3D(
                     feat_id=fid,
                     position=init_pos,
-                    covariance=np.eye(3) * self.settings.init_depth_var,
+                    covariance=self._init_cov_3d(z_obs, drive, feat_btau),
                     a=self.settings.a_init,
                     b=self.settings.b_init,
+                    ref_T_WC=T_WC.copy(),
+                    ref_uv=uv_curr.copy(),
+                    ref_stamp=stamp,
                 )
                 self._features3d[fid] = feat
-                self._update_feature_3d(feat, uv_curr, z_obs, drive)
-            elif feat.depth <= 0:
+                del self._pending[fid]
+                self._update_feature_3d(feat, uv_curr, z_obs, drive, feat_btau)
+                feat.track_length += 1
+                continue
+
+            # --- Existing features ---
+            T_curr_ref = T_CW_curr @ feat.ref_T_WC
+            R_ref = T_curr_ref[:3, :3]
+            t_ref = T_curr_ref[:3, 3]
+            z_obs, drive = self._triangulate(
+                feat.ref_uv, uv_curr, R_ref, t_ref, v_C,
+            )
+            t_ref_nsq = float(t_ref[0] ** 2 + t_ref[1] ** 2 + t_ref[2] ** 2)
+            feat_btau = 0.0
+            if P_vv_trans is not None and t_ref_nsq > 1e-16 and dt > 0:
+                t_ref_hat = t_ref / math.sqrt(t_ref_nsq)
+                dt_total = max(stamp - feat.ref_stamp, dt)
+                var_t = dt_total * dt * float(
+                    t_ref_hat @ P_vv_trans @ t_ref_hat
+                )
+                feat_btau = var_t / t_ref_nsq
+
+            if feat.depth > 0:
+                self._predict_feature_3d(feat, R, t, P_vv, dt)
+
+            if z_obs <= 0.0:
+                continue
+
+            flow_px = drive * float(self.K[0, 0])
+
+            if feat.depth <= 0:
                 init_pos = self._position_from_depth(
                     uv_curr, z_obs, self.settings.init_depth_var
                 )
                 feat.position = init_pos
-                feat.covariance = np.eye(3) * self.settings.init_depth_var
+                feat.covariance = self._init_cov_3d(z_obs, drive, feat_btau)
                 feat.a = self.settings.a_init
                 feat.b = self.settings.b_init
-                self._update_feature_3d(feat, uv_curr, z_obs, drive)
+                feat.ref_T_WC = T_WC.copy()
+                feat.ref_uv = uv_curr.copy()
+                feat.ref_stamp = stamp
+                self._update_feature_3d(feat, uv_curr, z_obs, drive, feat_btau)
+            elif flow_px >= self.settings.reanchor_flow_px:
+                self._update_feature_3d(feat, uv_curr, z_obs, drive, feat_btau)
+                feat.ref_T_WC = T_WC.copy()
+                feat.ref_uv = uv_curr.copy()
+                feat.ref_stamp = stamp
             else:
-                self._update_feature_3d(feat, uv_curr, z_obs, drive)
+                continue
 
             feat.track_length += 1
 
         lost = set(self._features3d.keys()) - set(curr_uvs.keys())
         for fid in lost:
             del self._features3d[fid]
+        lost_pending = set(self._pending.keys()) - set(curr_uvs.keys())
+        for fid in lost_pending:
+            del self._pending[fid]
 
         self._prev_T_WC = T_WC.copy()
         self._prev_stamp = stamp
@@ -954,6 +1169,18 @@ class SparseVogiatzisFilter3D(SparseVogiatzisFilter):
         x_norm = (uv[0] - cx) / fx
         y_norm = (uv[1] - cy) / fy
         return np.array([x_norm * depth, y_norm * depth, depth])
+
+    def _init_cov_3d(self, z_obs: float, drive: float,
+                     baseline_tau_sq: float) -> np.ndarray:
+        """Initial Normal-chart covariance.
+
+        Uses init_depth_var for all directions.  A wide isotropic prior
+        is necessary because the coupled bearing update aggressively
+        shrinks depth via cross-covariance — a tight depth init gets
+        crushed to ~1e-6 after a single update, causing overconfidence.
+        """
+        v0 = self.settings.init_depth_var
+        return np.eye(3) * v0
 
     def _predict_feature_3d(
         self,
@@ -989,7 +1216,13 @@ class SparseVogiatzisFilter3D(SparseVogiatzisFilter):
         cov_new = J @ feat.covariance @ J.T
 
         if P_vv is not None and dt > 0.0:
-            Q_euc = P_vv * (dt * dt)
+            if P_vv.shape == (6, 6):
+                P_ww = P_vv[0:3, 0:3]
+                P_trans = P_vv[3:6, 3:6]
+                qx = _skew(q_new)
+                Q_euc = dt * dt * (P_trans + qx @ P_ww @ qx.T)
+            else:
+                Q_euc = P_vv * (dt * dt)
         else:
             Q_euc = np.eye(3) * s.process_depth_var * max(dt, 1e-3)
 
@@ -1005,6 +1238,7 @@ class SparseVogiatzisFilter3D(SparseVogiatzisFilter):
             y_observed: np.ndarray,
             z_obs: float,
             drive: float,
+            baseline_tau_sq: float = 0.0,
         ) -> None:
         """Sequential decoupled update: bearing IEKF + Vogiatzis depth.
 
@@ -1118,16 +1352,15 @@ class SparseVogiatzisFilter3D(SparseVogiatzisFilter):
             feat.covariance = P_mid
             return
 
-        # Observation in log-depth chart.
+        # Observation is log(z_obs); Normal chart state is eps[2] = log(ρ/ρ₀)
+        # = -log(z/z₀).  So h(eps) = -eps[2] + const → H_dep = [0, 0, -1].
+        # The sign difference vs POLAR (d = +log z) cancels in J² → same τ².
         d_obs = math.log(z_obs)
         d_pred = math.log(z_mid)
         inn_depth = d_obs - d_pred
 
-        # H_dep = [0, 0, -1] in Normal chart (eps[2] = -log(z/z0)).
-        # S_dep = H_dep @ P_mid @ H_dep^T + tau_d^2
-        #       = P_mid[2,2] + tau_d^2
-        # tau_d^2 = z^2 * sigma_norm^2 / drive^2  (POLAR chart noise)
-        tau_d_sq = (z_obs * z_obs) * self._sigma_norm_sq / (drive * drive)
+        # S_dep = H_dep @ P_mid @ H_dep^T + tau_d^2 = P_mid[2,2] + tau_d^2
+        tau_d_sq = (z_obs * z_obs) * self._sigma_norm_sq / (drive * drive) + baseline_tau_sq
         S_dep = P_mid[2, 2] + tau_d_sq
 
         if S_dep < 1e-30:
