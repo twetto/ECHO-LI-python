@@ -112,6 +112,7 @@ class SparseVogSettings:
 
     # --- Process model ---
     process_depth_var: float = 0.01  # per-frame fallback when P_vv unavailable
+    min_canonical_var: float = 1e-12  # numerical floor for scalar covariance
 
     # --- Triangulation gating ---
     min_parallax: float = 1e-4   # ideal parallax mag (normalised image coords)
@@ -696,7 +697,7 @@ class SparseVogiatzisFilter:
             feat.canonical = -math.log(z_new)
         else:
             feat.canonical = z_new
-        feat.canonical_var = float(max(var_new, 1e-8))
+        feat.canonical_var = float(max(var_new, s.min_canonical_var))
         feat.cov_ce *= J
 
     # ------------------------------------------------------------------
@@ -757,7 +758,8 @@ class SparseVogiatzisFilter:
 
         # IEKF: iterate linearization point (eta is linear, only h(canonical) is nonlinear).
         m_iter = mu
-        for _ in range(3):
+        # for _ in range(3):
+        for _ in range(1):    # 1 seems enough
             H_i = self._rho_jacobian(m_iter)
             s_i = H_i * H_i * sigma_sq + 2.0 * H_i * cov_ce + var_eta + tau_rho
             if abs(s_i) < 1e-30:
@@ -777,8 +779,8 @@ class SparseVogiatzisFilter:
         diff = rho_obs - rho_pred - H * (mu - m_iter)
         m = mu + K_c * diff
         s_sq = sigma_sq - K_c * (H * sigma_sq + cov_ce)
-        if s_sq < 1e-8:
-            s_sq = 1e-8
+        if s_sq < s.min_canonical_var:
+            s_sq = s.min_canonical_var
 
         # Mahalanobis distance for gating (use final linearization).
         m_dist_sq = (diff * diff) / s_total
@@ -835,8 +837,8 @@ class SparseVogiatzisFilter:
         new_mu = w1 * m + w2 * mu
         E_x2 = w1 * (s_sq + m * m) + w2 * (sigma_sq + mu * mu)
         new_sigma_sq = E_x2 - new_mu * new_mu
-        if new_sigma_sq < 1e-8:
-            new_sigma_sq = 1e-8
+        if new_sigma_sq < s.min_canonical_var:
+            new_sigma_sq = s.min_canonical_var
 
         denom1 = ab_sum + 1.0
         denom2 = denom1 * (ab_sum + 2.0)
