@@ -1327,18 +1327,28 @@ class SparseVogiatzisFilter3D(SparseVogiatzisFilter):
             drive: float,
             baseline_tau_sq: float = 0.0,
         ) -> None:
-        """Flow-gated depth update (1D Vogiatzis mixture)."""
+        """Flow-gated depth update (1D Vogiatzis mixture).
+
+        Triangulation returns z-depth; we convert to distance using the
+        current bearing: dist_obs = z_obs / cos(theta).
+        """
         s = self.settings
         q = feat.position
         z_cur = float(np.linalg.norm(q))
         if z_cur < s.min_depth:
             return
 
-        d_obs = math.log(z_obs)
+        # Convert triangulated z-depth to log-distance.
+        cos_th = q[2] / z_cur if z_cur > 1e-6 else 1.0
+        if abs(cos_th) < 1e-6:
+            return
+        dist_obs = z_obs / cos_th
+        d_obs = math.log(dist_obs)
         d_pred = math.log(z_cur)
         inn_depth = d_obs - d_pred
 
         tau_d_sq = (z_obs * z_obs) * self._sigma_norm_sq / (drive * drive) + baseline_tau_sq
+        tau_d_sq /= (cos_th * cos_th)
         S_dep = feat.covariance[2, 2] + tau_d_sq
 
         if S_dep < 1e-30:

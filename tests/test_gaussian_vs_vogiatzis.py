@@ -113,7 +113,7 @@ def _gen_data(rng, n_steps, z_true, outlier_rate):
             u_obs = u_true + rng.normal(0, SIGMA_PIXEL)
             v_obs = v_true + rng.normal(0, SIGMA_PIXEL)
             
-        data.append((T_WC, np.array([u_obs, v_obs]), is_outlier))
+        data.append((T_WC, np.array([u_obs, v_obs]), is_outlier, P_C.copy()))
     return data
 
 
@@ -140,7 +140,7 @@ def _run_1d(param: DepthParametrization, is_vogiatzis: bool, data,
     err, var_, ir = np.empty(n), np.empty(n), np.empty(n)
 
     for i in range(n + 1):
-        T_WC, uv, _ = data[i]
+        T_WC, uv, _, P_C = data[i]
         meas = VisionMeasurement(
             stamp=i * DT,
             cam_coordinates={42: uv},
@@ -151,7 +151,7 @@ def _run_1d(param: DepthParametrization, is_vogiatzis: bool, data,
             feat = filt.features.get(42)
             if feat:
                 z_est = filt._canonical_to_depth(feat.canonical)
-                err[i-1] = abs(z_est - Z_TRUE)
+                err[i-1] = abs(z_est - P_C[2])
                 var_[i-1] = feat.canonical_var
                 ir[i-1] = feat.inlier_ratio()
             else:
@@ -178,7 +178,7 @@ def _run_3d(is_vogiatzis: bool, data, P_vv=None, ab_max=20.0,
     err, var_, ir = np.empty(n), np.empty(n), np.empty(n)
 
     for i in range(n + 1):
-        T_WC, uv, _ = data[i]
+        T_WC, uv, _, P_C = data[i]
         meas = VisionMeasurement(
             stamp=i * DT,
             cam_coordinates={42: uv},
@@ -188,8 +188,7 @@ def _run_3d(is_vogiatzis: bool, data, P_vv=None, ab_max=20.0,
         if i > 0:
             feat = filt.features.get(42)
             if feat:
-                err[i-1] = abs(feat.depth - Z_TRUE)
-                # In Normal chart, index 2 is log(ρ) = -log(z)
+                err[i-1] = np.linalg.norm(feat.position - P_C)
                 var_[i-1] = feat.covariance[2, 2]
                 ir[i-1] = feat.inlier_ratio()
             else:
