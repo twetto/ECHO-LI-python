@@ -131,6 +131,8 @@ class FeatureState:
     feat_id: int
     canonical: float = float('nan')  # z (EUCLIDEAN), rho=1/z (INVDEPTH), or -log(z) (POLAR)
     canonical_var: float = 1.0
+    cov_ce: float = 0.0   # cross-covariance canonical × eta_ref (rho-space ref pixel noise)
+    var_eta: float = 0.0   # variance of eta_ref (reference pixel noise in rho-space)
     a: float = 10.0
     b: float = 2.0
     track_length: int = 0
@@ -318,17 +320,29 @@ class SparseVogiatzisFilter:
                     feat_btau = var_t / t_ref_nsq
 
                 rho_obs, tau_rho = self._obs_and_tau(z_obs, drive, None, feat_btau)
-                init_obs, init_var = self._rho_to_canonical(rho_obs, tau_rho)
+                tau_pixel = self._sigma_norm_sq / (drive * drive)
+                init_obs, init_var = self._rho_to_canonical(
+                    rho_obs, tau_rho + tau_pixel,
+                )
+                init_cov_ce = tau_pixel
+                init_var_eta = tau_pixel
                 if flowdep is not None:
                     fd_depth, fd_var = flowdep.query_depth(
                         float(uv_curr[0]), float(uv_curr[1]),
                     )
                     if fd_depth > 0:
                         init_obs, init_var = self._canonical_from_depth(fd_depth, fd_var)
+                        init_cov_ce = 0.0
+                        init_var_eta = 0.0
+                H_init = self._rho_jacobian(init_obs)
+                if abs(H_init) > 1e-30:
+                    init_cov_ce /= H_init
                 feat = FeatureState(
                     feat_id=fid,
                     canonical=init_obs,
                     canonical_var=init_var,
+                    cov_ce=init_cov_ce,
+                    var_eta=init_var_eta,
                     a=self.settings.a_init,
                     b=self.settings.b_init,
                     ref_T_WC=T_WC.copy(),
@@ -367,22 +381,29 @@ class SparseVogiatzisFilter:
 
             flow_px = drive * float(self.K[0, 0])
 
+            tau_pixel = self._sigma_norm_sq / (drive * drive)
+
             if not math.isfinite(feat.canonical):
                 # Prediction invalidated — reset from obs + fresh reference.
                 rho_obs, tau_rho = self._obs_and_tau(z_obs, drive, None, feat_btau)
-                c_init, v_init = self._rho_to_canonical(rho_obs, tau_rho)
+                c_init, v_init = self._rho_to_canonical(
+                    rho_obs, tau_rho + tau_pixel,
+                )
                 feat.canonical = c_init
                 feat.canonical_var = v_init
+                H_init = self._rho_jacobian(c_init)
+                feat.var_eta = tau_pixel
+                feat.cov_ce = tau_pixel / H_init if abs(H_init) > 1e-30 else 0.0
                 feat.a = self.settings.a_init
                 feat.b = self.settings.b_init
                 feat.ref_T_WC = T_WC.copy()
                 feat.ref_uv = uv_curr.copy()
                 feat.ref_stamp = stamp
                 rho_obs2, tau_rho2 = self._obs_and_tau(z_obs, drive, feat, feat_btau)
-                self._vogiatzis_update(feat, rho_obs2, tau_rho2)
+                self._vogiatzis_update(feat, rho_obs2, tau_rho2, tau_pixel)
             elif flow_px >= self.settings.reanchor_flow_px:
                 rho_obs, tau_rho = self._obs_and_tau(z_obs, drive, feat, feat_btau)
-                self._vogiatzis_update(feat, rho_obs, tau_rho)
+                self._vogiatzis_update(feat, rho_obs, tau_rho, tau_pixel)
                 feat.ref_T_WC = T_WC.copy()
                 feat.ref_uv = uv_curr.copy()
                 feat.ref_stamp = stamp
@@ -676,6 +697,7 @@ class SparseVogiatzisFilter:
         else:
             feat.canonical = z_new
         feat.canonical_var = float(max(var_new, 1e-8))
+        feat.cov_ce *= J
 
     # ------------------------------------------------------------------
     # Vogiatzis moment-matched update (scalar)
@@ -710,38 +732,51 @@ class SparseVogiatzisFilter:
         feat: FeatureState,
         rho_obs: float,
         tau_rho: float,
+        tau_pixel: float = 0.0,
     ) -> None:
-        """1D Gaussian-Beta mixture update with indirect rho-space observation.
+        """Gaussian-Beta mixture update with 2D augmented state.
 
-        Observation is always rho_obs (unbiased).  For non-InvDepth
-        parametrizations, uses IEKF (iterated EKF) to handle the
-        nonlinear h(canonical) → rho mapping.
+        State is [canonical, eta_ref] where eta_ref tracks the reference
+        pixel noise contribution in rho-space.  Observation model:
+            rho_obs = h(canonical) + eta_ref + n_curr
+        with H = [d(rho)/d(canonical), 1] and R = tau_rho.
+
+        The 2D gain accounts for the cross-covariance between the state
+        and the reference pixel noise, fixing NEES underconfidence caused
+        by re-anchor observation correlation.
+
+        tau_pixel is sigma_norm^2 / drive^2 (used for re-anchor cross-cov).
         """
         s = self.settings
         mu = feat.canonical
         sigma_sq = feat.canonical_var
+        cov_ce = feat.cov_ce
+        var_eta = feat.var_eta
         a = feat.a
         b = feat.b
 
-        # IEKF: iterate linearization point for inlier Kalman branch.
+        # IEKF: iterate linearization point (eta is linear, only h(canonical) is nonlinear).
         m_iter = mu
         for _ in range(3):
             H_i = self._rho_jacobian(m_iter)
-            H2_i = H_i * H_i
-            s_i = H2_i * sigma_sq + tau_rho
-            K_i = sigma_sq * H_i / s_i
+            s_i = H_i * H_i * sigma_sq + 2.0 * H_i * cov_ce + var_eta + tau_rho
+            if abs(s_i) < 1e-30:
+                break
+            K_c_i = (H_i * sigma_sq + cov_ce) / s_i
             rho_pred_i = self._rho_from_canonical(m_iter)
             innov_i = rho_obs - rho_pred_i - H_i * (mu - m_iter)
-            m_iter = mu + K_i * innov_i
+            m_iter = mu + K_c_i * innov_i
 
         H = self._rho_jacobian(m_iter)
-        H2 = H * H
-        s_total = H2 * sigma_sq + tau_rho
-        K = sigma_sq * H / s_total
+        s_total = H * H * sigma_sq + 2.0 * H * cov_ce + var_eta + tau_rho
+        if abs(s_total) < 1e-30:
+            return
+        K_c = (H * sigma_sq + cov_ce) / s_total
+        K_e = (H * cov_ce + var_eta) / s_total
         rho_pred = self._rho_from_canonical(m_iter)
         diff = rho_obs - rho_pred - H * (mu - m_iter)
-        m = mu + K * diff
-        s_sq = sigma_sq * (1.0 - K * H)
+        m = mu + K_c * diff
+        s_sq = sigma_sq - K_c * (H * sigma_sq + cov_ce)
         if s_sq < 1e-8:
             s_sq = 1e-8
 
@@ -759,14 +794,17 @@ class SparseVogiatzisFilter:
             z_reset = 1.0 / rho_obs
             if self._param is DepthParametrization.INVDEPTH:
                 feat.canonical = rho_obs
-                feat.canonical_var = tau_rho
+                feat.canonical_var = tau_rho + tau_pixel
             elif self._param is DepthParametrization.POLAR:
                 feat.canonical = -math.log(z_reset)
                 H_r = self._rho_jacobian(feat.canonical)
-                feat.canonical_var = tau_rho / (H_r * H_r) if abs(H_r) > 1e-30 else tau_rho
+                feat.canonical_var = (tau_rho + tau_pixel) / (H_r * H_r) if abs(H_r) > 1e-30 else tau_rho
             else:
                 feat.canonical = z_reset
-                feat.canonical_var = z_reset ** 4 * tau_rho
+                feat.canonical_var = z_reset ** 4 * (tau_rho + tau_pixel)
+            H_r2 = self._rho_jacobian(feat.canonical)
+            feat.var_eta = tau_pixel
+            feat.cov_ce = tau_pixel / H_r2 if abs(H_r2) > 1e-30 else 0.0
             feat.a = s.a_init
             feat.b = s.b_init
             return
@@ -787,6 +825,8 @@ class SparseVogiatzisFilter:
 
         if Z_norm < 1e-30:
             feat.b = min(b + 1.0, s.ab_max)
+            feat.var_eta = tau_pixel
+            feat.cov_ce = 0.0
             return
 
         w1 = C1 / Z_norm
@@ -824,6 +864,10 @@ class SparseVogiatzisFilter:
         feat.canonical_var = float(new_sigma_sq)
         feat.a = new_a
         feat.b = new_b
+
+        # Re-anchor cross-covariance: mixture-weighted Kalman gain × tau_pixel
+        feat.var_eta = tau_pixel
+        feat.cov_ce = w1 * K_c * tau_pixel
 
     # ------------------------------------------------------------------
     # Query interface (for EqF warmstart)
