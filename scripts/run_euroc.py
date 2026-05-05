@@ -109,6 +109,8 @@ def main():
                         help="Enable FlowDep dense depth filter (Phase c)")
     parser.add_argument("--sparse-vog", action="store_true",
                         help="Enable SparseVogiatzis filter (~300 sparse features)")
+    parser.add_argument("--grid-densify", action="store_true",
+                        help="Enable sparse-vog grid densification debug overlay")
     parser.add_argument("--chart", type=str, default=None,
                         choices=["Euclidean", "InvDepth", "Normal", "Polar"],
                         help="Override coordinateChoice from the YAML config")
@@ -440,6 +442,44 @@ def main():
         flowdep_debug = FlowDepDebugWindow(enabled=True)
         print("FlowDep debug window enabled (press 'd' depth/var, 'q' quit)")
 
+    grid_densifier = None
+    grid_debug = None
+    if args.grid_densify:
+        if sparse_vog_filter is None:
+            print("WARNING: --grid-densify requires --sparse-vog; disabled")
+        else:
+            from eqvio.grid_densifier import GridDensifier, GridDensifierSettings
+            grid_cfg = config.get('GridDensifier', {}) if args.config.exists() else {}
+            grid_stride = int(grid_cfg.get('stride', 16))
+            grid_window_size = grid_cfg.get('window_size', None)
+            w_cam, h_cam = camera.image_size
+            grid_densifier = GridDensifier(
+                camera.K_matrix(),
+                (w_cam, h_cam),
+                GridDensifierSettings(
+                    stride=grid_stride,
+                    window_size=grid_window_size,
+                    max_depth=grid_cfg.get('max_depth', 20.0),
+                    z_abs_cluster=grid_cfg.get('z_abs_cluster', 0.25),
+                    z_rel_cluster=grid_cfg.get('z_rel_cluster', 0.08),
+                    mapped_min_support=grid_cfg.get('mapped_min_support', 3),
+                    thin_min_support=grid_cfg.get('thin_min_support', 2),
+                    min_depth=grid_cfg.get('min_depth', 0.1),
+                    region_grow_enabled=grid_cfg.get('region_grow_enabled', True),
+                    region_grow_max_steps=grid_cfg.get('region_grow_max_steps', 2),
+                    region_grow_max_depth_jump=grid_cfg.get('region_grow_max_depth_jump', 0.5),
+                    region_grow_var_scale=grid_cfg.get('region_grow_var_scale', 2.0),
+                    region_grow_depth_step=grid_cfg.get('region_grow_depth_step', 0.5),
+                    region_grow_fill_far=grid_cfg.get('region_grow_fill_far', True),
+                ),
+            )
+            print(f"Sparse grid densifier enabled (stride={grid_stride}, "
+                  f"window={grid_densifier._window_size:g})")
+            if args.display:
+                from eqvio.grid_densifier import GridDensifierDebugWindow
+                grid_debug = GridDensifierDebugWindow(enabled=True)
+                print("Sparse grid depth window enabled (press 'q' in grid window to close)")
+
     timestamps_out = []
     from eqvio.loop_timer import LoopTimer
     timer = LoopTimer()
@@ -643,6 +683,21 @@ def main():
                     vio_filter.augment_planes(plane_cps, plane_inliers)
                     timer.stop("plane_augment")
 
+            grid_depth = None
+            grid_var = None
+            grid_state = None
+            if grid_densifier is not None and sparse_vog_filter is not None:
+                timer.start("grid_densify")
+                grid_densifier.update(sparse_vog_filter, sparse_vog_plane_detector)
+                grid_depth, grid_var, grid_state = grid_densifier.dense_depth_grid()
+                timer.stop("grid_densify")
+                if grid_debug is not None:
+                    debug_depth, debug_var, debug_state = grid_densifier.dense_debug_grid()
+                    grid_debug.update(
+                        debug_depth, debug_var, debug_state,
+                        unconverged_count=grid_densifier.unconverged_count,
+                    )
+
             # Camera debug window
             if cam_debug is not None:
                 # Build sparse Vogiatzis depth dict for overlay.
@@ -786,6 +841,8 @@ def main():
         cam_debug.close()
     if flowdep_debug is not None:
         flowdep_debug.close()
+    if grid_debug is not None:
+        grid_debug.close()
 
     if visualiser is not None:
         visualiser.finish()

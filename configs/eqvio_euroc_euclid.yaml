@@ -1,25 +1,31 @@
 GIFT:
   equaliseImageHistogram: true
   useFastFeatures: false
-  #featureDist: 40.0
-  featureDist: 20.0
+  # featureDist: 40.0
+  # featureDist: 20.0
+  featureDist: 16.0
   featureSearchThreshold: 0.8
   maxError: 50.0
-  maxFeatures: 300  # LK tracker pool (feeds sparse_vog). EqF cap is --max-features.
+  # maxFeatures: 300  # LK tracker pool (feeds sparse_vog). EqF cap is --max-features.
+  maxFeatures: 1500
   maxLevel: 3
-  minHarrisQuality: 0.05
+  # minHarrisQuality: 0.05
+  minHarrisQuality: 0.005
   ransacParams:
     inlierThreshold: 0.003
     maxIterations: 30
+    # maxIterations: 0
     minDataPoints: 5
     minInliers: 15
-  trackedFeatureDist: 15.0
+  # trackedFeatureDist: 15.0
+  trackedFeatureDist: 16.0
   winSize: 21
   # Occlusion detection: none, zncc, lbp, orb
-  occlusionCheckMethod: lbp     # RI-LBP (rotation-invariant local binary pattern)
-  occlusionCheckThreshold: 0.1  # method-dependent: zncc=0.8, lbp=0.1, orb=2000
-  referencePatchSize: 15        # patch window for LBP/ORB/ZNCC descriptor extraction
-  lbpRadius: 3                  # RI-LBP sampling radius
+  # occlusionCheckMethod: lbp     # RI-LBP (rotation-invariant local binary pattern)
+  occlusionCheckMethod: none     # RI-LBP (rotation-invariant local binary pattern)
+  # occlusionCheckThreshold: 0.1  # method-dependent: zncc=0.8, lbp=0.1, orb=2000
+  # referencePatchSize: 15        # patch window for LBP/ORB/ZNCC descriptor extraction
+  # lbpRadius: 3                  # RI-LBP sampling radius
 eqf:
   maxFeatures: 40           # core EqF landmark cap
   initialValue:
@@ -92,22 +98,42 @@ FlowDep:
   ab_max: 20.0
   min_inlier_ratio: 0.5      # gate query() landmark init
   mahalanobis_reset_chi2: 9.0  # reset stuck outlier pixels when obs disagrees (<=0 disables)
+GridDensifier:
+  stride: 16
+  window_size: 32        # default is 2 * stride
+  max_depth: 20.0
+  z_abs_cluster: 0.25
+  z_rel_cluster: 0.08
+  mapped_min_support: 3
+  thin_min_support: 2
+  min_depth: 0.1
+  region_grow_enabled: false
+  # region_grow_max_steps: 8
+  # region_grow_max_depth_jump: 0.5
+  # region_grow_var_scale: 2.0
+  # region_grow_depth_step: 0.0
+  # region_grow_fill_far: false
 SparseVog:
   # Per-feature Vogiatzis filter.
   # parametrization: euclidean, invdepth, polar (1D scalar)
   #                   polar3d (3D Local IEKF on Normal chart)
-  parametrization: polar3d
-  max_pool_size: 300
+  # parametrization: polar3d
+  parametrization: invdepth
+  # max_pool_size: 300
+  max_pool_size: 1500
   min_track_length: 5
   conv_inlier_ratio: 0.7        # a/(a+b) gate for query()
   conv_variance_threshold: 0.02 # var(z) gate for query()
   init_depth_var: 1.0
   sigma_pixel: 0.5              # pixel noise for obs tau^2 = z^4 * sigma^2 / drive^2
   uniform_z_max: 20.0           # outlier uniform density: 1/z_max
-  a_init: 10.0
-  b_init: 2.0
+  # a_init: 10.0
+  # b_init: 2.0
+  a_init: 100000000.0
+  b_init: 0.00000001
   ab_min: 1.0
-  ab_max: 20.0
+  # ab_max: 20.0
+  ab_max: 1000000000.0
   min_inlier_ratio: 0.5         # gate for Mahalanobis stuck-outlier reset
   mahalanobis_reset_chi2: 4.5
   process_depth_var: 0.01       # fallback when P_vv unavailable
