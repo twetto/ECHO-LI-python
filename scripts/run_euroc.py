@@ -32,11 +32,14 @@ from eqvio.dataserver.asl_dataset import ASLDatasetReader
 from eqvio.mathematical.imu_velocity import IMUVelocity
 from eqvio.mathematical.vision_measurement import VisionMeasurement
 from eqvio.mathematical.vio_state import VIOState, StampedPose
+from eqvio.fast_gift import install_fast_point_tracker
 from eqvio.vio_filter import VIOFilter, VIOFilterSettings
 
 # GIFT imports
 from gift.tracker import PointFeatureTracker, OcclusionCheckMethod, _DEFAULT_OCCLUSION_THRESHOLDS
 from gift.feature import Feature
+
+install_fast_point_tracker()
 
 # Plane detection
 from eqvio.plane_detection import (

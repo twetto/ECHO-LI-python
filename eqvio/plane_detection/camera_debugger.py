@@ -269,9 +269,12 @@ class CameraDebugWindow:
             if uv is None:
                 continue
             normed = np.clip((depth - vmin) / span, 0.0, 1.0)
-            gray = np.array([[int(normed * 255)]], dtype=np.uint8)
-            bgr = cv2.applyColorMap(gray, cv2.COLORMAP_JET)[0, 0]
-            colour = (int(bgr[0]), int(bgr[1]), int(bgr[2]))
+            if np.isfinite(normed):
+                gray = np.array([[int(normed * 255)]], dtype=np.uint8)
+                bgr = cv2.applyColorMap(gray, cv2.COLORMAP_JET)[0, 0]
+                colour = (int(bgr[0]), int(bgr[1]), int(bgr[2]))
+            else:
+                colour = (128, 128, 128)
             pt = (int(round(uv[0])), int(round(uv[1])))
             if converged:
                 cv2.circle(img_out, pt, 7, colour, cv2.FILLED, cv2.LINE_AA)
