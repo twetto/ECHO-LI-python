@@ -13,10 +13,12 @@ GIFT:
   minHarrisQuality: 0.005
   ransacParams:
     inlierThreshold: 0.003
-    maxIterations: 30
-    # maxIterations: 0
-    minDataPoints: 5
-    minInliers: 15
+    # maxIterations: 30
+    maxIterations: 0
+    # minDataPoints: 5
+    # minInliers: 15
+    minDataPoints: 15
+    minInliers: 40
   # trackedFeatureDist: 15.0
   trackedFeatureDist: 16.0
   winSize: 21
@@ -99,6 +101,13 @@ FlowDep:
   min_inlier_ratio: 0.5      # gate query() landmark init
   mahalanobis_reset_chi2: 9.0  # reset stuck outlier pixels when obs disagrees (<=0 disables)
 GridDensifier:
+  mode: flow_sparse       # grid or flow_sparse
+  flow_sparse_scale: 0.25
+  flow_sparse_cell_size_px: 32
+  flow_sparse_min_derotated_flow: 1.0e-6
+  flow_sparse_min_weight: 1.0e-6
+  flow_sparse_scale_interp_radius_cells: 0
+  flow_sparse_scale_interp_power: 2.0
   stride: 16
   window_size: 32        # default is 2 * stride
   max_depth: 20.0
@@ -107,12 +116,23 @@ GridDensifier:
   mapped_min_support: 3
   thin_min_support: 2
   min_depth: 0.1
-  region_grow_enabled: false
+  region_grow_enabled: true
   # region_grow_max_steps: 8
   # region_grow_max_depth_jump: 0.5
   # region_grow_var_scale: 2.0
   # region_grow_depth_step: 0.0
-  # region_grow_fill_far: false
+  region_grow_fill_far: false
+  # DIS-guided region growing uses optical-flow/image edges as a soft boundary
+  # prior. Sparse GB depths remain the metric source.
+  flow_guided_region_grow: true
+  # flow_guided_max_flow_diff: 0.75
+  # flow_guided_max_edge: 35.0
+  # Fill remaining unknown cells from nearby sparse-depth seeds with similar
+  # raw DIS flow. This is an obstacle-avoidance fill, not metric flow-depth
+  # triangulation.
+  flow_interpolate_unknown: true
+  # flow_interp_radius_cells: 3
+  # flow_interp_min_weight: 1.0e-3
 SparseVog:
   # Per-feature Vogiatzis filter.
   # parametrization: euclidean, invdepth, polar (1D scalar)
@@ -127,15 +147,16 @@ SparseVog:
   init_depth_var: 1.0
   sigma_pixel: 0.5              # pixel noise for obs tau^2 = z^4 * sigma^2 / drive^2
   uniform_z_max: 20.0           # outlier uniform density: 1/z_max
-  # a_init: 10.0
-  # b_init: 2.0
-  a_init: 100000000.0
-  b_init: 0.00000001
+  a_init: 10.0
+  b_init: 2.0
+  # a_init: 100000000.0
+  # b_init: 0.00000001
   ab_min: 1.0
-  # ab_max: 20.0
-  ab_max: 1000000000.0
+  ab_max: 20.0
+  # ab_max: 1000000000.0
   min_inlier_ratio: 0.5         # gate for Mahalanobis stuck-outlier reset
-  mahalanobis_reset_chi2: 4.5
+  # mahalanobis_reset_chi2: 4.5
+  mahalanobis_reset_chi2: 0.1
   process_depth_var: 0.01       # fallback when P_vv unavailable
   min_parallax: 1.0e-4
   min_cos_sim: 0.95
@@ -146,3 +167,9 @@ SparseVog:
   pd_max_dist_between_z: 0.15
   pd_max_norm_deg: 25
   pd_min_plane_features: 4
+PatchDepth:
+  scale: 1.0
+  patch_size: 8
+  patch_stride: 4
+  cell_size: 8
+  seed_radius_px: 32

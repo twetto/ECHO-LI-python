@@ -37,7 +37,8 @@ from eqvio.mathematical.vio_state import Landmark
 Z_TRUE = 100.0
 FX = FY = 458.0
 CX, CY = 376.0, 240.0
-SIGMA_PIXEL = 0.1
+# SIGMA_PIXEL = 0.1
+SIGMA_PIXEL = 0.5
 BASELINE_PER_FRAME = 0.05
 DT = 0.05
 N_STEPS = 100

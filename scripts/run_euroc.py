@@ -109,8 +109,8 @@ def main():
                         help="Enable FlowDep dense depth filter (Phase c)")
     parser.add_argument("--sparse-vog", action="store_true",
                         help="Enable SparseVogiatzis filter (~300 sparse features)")
-    parser.add_argument("--grid-densify", action="store_true",
-                        help="Enable sparse-vog grid densification debug overlay")
+    parser.add_argument("--patch-depth", action="store_true",
+                        help="Enable patch-grid direct depth mapper")
     parser.add_argument("--chart", type=str, default=None,
                         choices=["Euclidean", "InvDepth", "Normal", "Polar"],
                         help="Override coordinateChoice from the YAML config")
@@ -442,43 +442,56 @@ def main():
         flowdep_debug = FlowDepDebugWindow(enabled=True)
         print("FlowDep debug window enabled (press 'd' depth/var, 'q' quit)")
 
-    grid_densifier = None
-    grid_debug = None
-    if args.grid_densify:
+    # Patch-grid direct depth mapper
+    patch_depth_mapper = None
+    patch_depth_debug = None
+    patch_depth_prev_gray = None
+    patch_depth_prev_T_WC = None
+    if args.patch_depth:
         if sparse_vog_filter is None:
-            print("WARNING: --grid-densify requires --sparse-vog; disabled")
+            print("WARNING: --patch-depth requires --sparse-vog; disabled")
         else:
-            from eqvio.grid_densifier import GridDensifier, GridDensifierSettings
-            grid_cfg = config.get('GridDensifier', {}) if args.config.exists() else {}
-            grid_stride = int(grid_cfg.get('stride', 16))
-            grid_window_size = grid_cfg.get('window_size', None)
+            from eqvio.patch_depth_mapper import PatchDepthMapper, PatchDepthSettings
+            patch_depth_cfg = config.get('PatchDepth', {}) if args.config.exists() else {}
+            K_patch = camera.K_matrix()
+            patch_dist = np.array(
+                getattr(camera, 'dist', [0.0, 0.0, 0.0, 0.0]),
+                dtype=np.float64,
+            )
             w_cam, h_cam = camera.image_size
-            grid_densifier = GridDensifier(
-                camera.K_matrix(),
-                (w_cam, h_cam),
-                GridDensifierSettings(
-                    stride=grid_stride,
-                    window_size=grid_window_size,
-                    max_depth=grid_cfg.get('max_depth', 20.0),
-                    z_abs_cluster=grid_cfg.get('z_abs_cluster', 0.25),
-                    z_rel_cluster=grid_cfg.get('z_rel_cluster', 0.08),
-                    mapped_min_support=grid_cfg.get('mapped_min_support', 3),
-                    thin_min_support=grid_cfg.get('thin_min_support', 2),
-                    min_depth=grid_cfg.get('min_depth', 0.1),
-                    region_grow_enabled=grid_cfg.get('region_grow_enabled', True),
-                    region_grow_max_steps=grid_cfg.get('region_grow_max_steps', 2),
-                    region_grow_max_depth_jump=grid_cfg.get('region_grow_max_depth_jump', 0.5),
-                    region_grow_var_scale=grid_cfg.get('region_grow_var_scale', 2.0),
-                    region_grow_depth_step=grid_cfg.get('region_grow_depth_step', 0.5),
-                    region_grow_fill_far=grid_cfg.get('region_grow_fill_far', True),
+            patch_mapx, patch_mapy = cv2.initUndistortRectifyMap(
+                K_patch, patch_dist, None,
+                K_patch, (w_cam, h_cam), cv2.CV_32FC1,
+            )
+            patch_depth_mapper = PatchDepthMapper(
+                K_patch,
+                PatchDepthSettings(
+                    scale=float(patch_depth_cfg.get('scale', 0.25)),
+                    patch_size=int(patch_depth_cfg.get('patch_size', 16)),
+                    patch_stride=int(patch_depth_cfg.get('patch_stride', 8)),
+                    cell_size=int(patch_depth_cfg.get('cell_size', 16)),
+                    max_depth=float(patch_depth_cfg.get('max_depth', 20.0)),
+                    min_depth=float(patch_depth_cfg.get('min_depth', 0.1)),
+                    photo_huber_delta=float(patch_depth_cfg.get('photo_huber_delta', 5.0)),
+                    lambda_seed=float(patch_depth_cfg.get('lambda_seed', 1.0)),
+                    seed_radius_px=float(patch_depth_cfg.get('seed_radius_px', 32.0)),
+                    sigma_seed_floor=float(patch_depth_cfg.get('sigma_seed_floor', 0.01)),
+                    n_gn_iters=int(patch_depth_cfg.get('n_gn_iters', 5)),
                 ),
             )
-            print(f"Sparse grid densifier enabled (stride={grid_stride}, "
-                  f"window={grid_densifier._window_size:g})")
+            print(f"Patch-grid depth mapper enabled "
+                  f"(scale={patch_depth_mapper.s.scale}, "
+                  f"patch={patch_depth_mapper.s.patch_size}, "
+                  f"stride={patch_depth_mapper.s.patch_stride}, "
+                  f"cell={patch_depth_mapper.s.cell_size})")
             if args.display:
-                from eqvio.grid_densifier import GridDensifierDebugWindow
-                grid_debug = GridDensifierDebugWindow(enabled=True)
-                print("Sparse grid depth window enabled (press 'q' in grid window to close)")
+                from eqvio.patch_depth_visualiser import PatchDepthDebugWindow
+                patch_depth_debug = PatchDepthDebugWindow(
+                    enabled=True,
+                    depth_min=float(patch_depth_cfg.get('vis_depth_min', 0.0)),
+                    depth_max=float(patch_depth_cfg.get('vis_depth_max', 5.0)),
+                )
+                print("Patch depth window enabled (press 'd' depth/var, 's' status, 'q' quit)")
 
     timestamps_out = []
     from eqvio.loop_timer import LoopTimer
@@ -683,20 +696,35 @@ def main():
                     vio_filter.augment_planes(plane_cps, plane_inliers)
                     timer.stop("plane_augment")
 
-            grid_depth = None
-            grid_var = None
-            grid_state = None
-            if grid_densifier is not None and sparse_vog_filter is not None:
-                timer.start("grid_densify")
-                grid_densifier.update(sparse_vog_filter, sparse_vog_plane_detector)
-                grid_depth, grid_var, grid_state = grid_densifier.dense_depth_grid()
-                timer.stop("grid_densify")
-                if grid_debug is not None:
-                    debug_depth, debug_var, debug_state = grid_densifier.dense_debug_grid()
-                    grid_debug.update(
-                        debug_depth, debug_var, debug_state,
-                        unconverged_count=grid_densifier.unconverged_count,
+            # Patch-grid direct depth
+            if patch_depth_mapper is not None and sparse_vog_filter is not None:
+                T_WC_pd = (state.sensor.pose * state.sensor.camera_offset).asMatrix()
+                image_pd = cv2.remap(image, patch_mapx, patch_mapy, cv2.INTER_LINEAR)
+                image_pd_f32 = image_pd.astype(np.float32)
+                if patch_depth_prev_gray is not None:
+                    timer.start("patch_depth")
+                    # T_ref_curr: maps current-frame 3D points to reference frame
+                    # p_ref = T_ref_curr @ p_curr
+                    T_ref_curr = np.linalg.inv(patch_depth_prev_T_WC) @ T_WC_pd
+                    pd_depth, pd_var, pd_status = patch_depth_mapper.update(
+                        sparse_vog_filter,
+                        image_pd_f32,
+                        patch_depth_prev_gray,
+                        T_ref_curr,
                     )
+                    timer.stop("patch_depth")
+                    if patch_depth_debug is not None:
+                        n_seeds = sum(
+                            1 for fid in sparse_vog_filter.feat_uvs
+                            if sparse_vog_filter.query(fid)[0] > 0
+                        )
+                        patch_depth_debug.update(
+                            pd_depth, pd_var, pd_status, n_seeds=n_seeds,
+                        )
+                        if not patch_depth_debug.enabled:
+                            break
+                patch_depth_prev_gray = image_pd_f32
+                patch_depth_prev_T_WC = T_WC_pd.copy()
 
             # Camera debug window
             if cam_debug is not None:
@@ -841,8 +869,8 @@ def main():
         cam_debug.close()
     if flowdep_debug is not None:
         flowdep_debug.close()
-    if grid_debug is not None:
-        grid_debug.close()
+    if patch_depth_debug is not None:
+        patch_depth_debug.close()
 
     if visualiser is not None:
         visualiser.finish()

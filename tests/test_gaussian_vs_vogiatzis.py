@@ -48,8 +48,8 @@ from eqvio.mathematical.vision_measurement import VisionMeasurement
 Z_TRUE = 100.0
 FX = FY = 458.0
 CX, CY = 376.0, 240.0
-# SIGMA_PIXEL = 0.5
-SIGMA_PIXEL = 0.1
+SIGMA_PIXEL = 0.5
+# SIGMA_PIXEL = 0.1
 BASELINE_PER_FRAME = 0.05        # camera moves 5 cm per frame
 DT = 0.05                        # 20 fps
 N_STEPS = 100
