@@ -76,6 +76,9 @@ class PatchDepthSettings:
     min_photo_curvature: float = 1e-6
     max_photo_residual: float = 20.0
 
+    # Coarse-to-fine pyramid (ROVIO-style: all levels in one GN solve)
+    n_pyramid_levels: int = 1
+
     # Cell fusion
     var_floor: float = 1e-6
     status_weight_photo: float = 1.0
@@ -302,11 +305,10 @@ class PatchDepthMapper:
         seed_radius_scaled = s.seed_radius_px * sc if sc < 1.0 else s.seed_radius_px
         sigma_photo_sq = s.sigma_photo * s.sigma_photo
 
-        # Precompute reference image gradients (central difference)
-        ref_grad_x = np.zeros_like(ref_f32)
-        ref_grad_y = np.zeros_like(ref_f32)
-        ref_grad_x[:, 1:-1] = (ref_f32[:, 2:] - ref_f32[:, :-2]) * 0.5
-        ref_grad_y[1:-1, :] = (ref_f32[2:, :] - ref_f32[:-2, :]) * 0.5
+        # Build image pyramid (ROVIO-style: all levels in one GN solve)
+        n_levels = s.n_pyramid_levels
+        pyr_curr, pyr_ref, pyr_grad_x, pyr_grad_y, pyr_fx, pyr_fy, pyr_cx, pyr_cy = \
+            _build_pyramid(curr_f32, ref_f32, fx, fy, cx, cy, n_levels)
 
         # Build spatial grid for seed lookup
         seed_grid_ids, seed_grid_starts, seed_grid_cols = _build_seed_grid(
@@ -318,9 +320,10 @@ class PatchDepthMapper:
             patch_residual, patch_curvature,
             seed_uv, seed_rho, seed_var,
             seed_grid_ids, seed_grid_starts, seed_grid_cols,
-            curr_f32, ref_f32, ref_grad_x, ref_grad_y,
+            pyr_curr, pyr_ref, pyr_grad_x, pyr_grad_y,
+            pyr_fx, pyr_fy, pyr_cx, pyr_cy,
+            n_levels,
             R, t,
-            fx, fy, cx, cy,
             s.patch_size, s.lambda_seed, seed_radius_scaled,
             s.sigma_seed_floor,
             s.photo_huber_delta,
@@ -377,6 +380,60 @@ class PatchDepthMapper:
             np.array(rhos, dtype=np.float64),
             np.array(vars_, dtype=np.float64),
         )
+
+
+# ============================================================================
+# Image pyramid
+# ============================================================================
+
+def _build_pyramid(
+    curr_f32: np.ndarray,
+    ref_f32: np.ndarray,
+    fx: float, fy: float, cx: float, cy: float,
+    n_levels: int,
+) -> tuple:
+    """Build Gaussian image pyramid with precomputed gradients.
+
+    Returns numba typed lists for (curr, ref, grad_x, grad_y) images
+    and numpy arrays for (fx, fy, cx, cy) per level.
+    """
+    import cv2
+
+    pyr_curr = numba.typed.List()
+    pyr_ref = numba.typed.List()
+    pyr_grad_x = numba.typed.List()
+    pyr_grad_y = numba.typed.List()
+    pyr_fx = np.empty(n_levels, dtype=np.float64)
+    pyr_fy = np.empty(n_levels, dtype=np.float64)
+    pyr_cx = np.empty(n_levels, dtype=np.float64)
+    pyr_cy = np.empty(n_levels, dtype=np.float64)
+
+    c_img = curr_f32
+    r_img = ref_f32
+
+    for lv in range(n_levels):
+        if lv > 0:
+            c_img = cv2.pyrDown(c_img)
+            r_img = cv2.pyrDown(r_img)
+
+        pyr_curr.append(c_img.astype(np.float32))
+        pyr_ref.append(r_img.astype(np.float32))
+
+        # Precompute reference image gradients (central difference)
+        gx = np.zeros_like(r_img)
+        gy = np.zeros_like(r_img)
+        gx[:, 1:-1] = (r_img[:, 2:] - r_img[:, :-2]) * 0.5
+        gy[1:-1, :] = (r_img[2:, :] - r_img[:-2, :]) * 0.5
+        pyr_grad_x.append(gx.astype(np.float32))
+        pyr_grad_y.append(gy.astype(np.float32))
+
+        scale = 1.0 / (1 << lv)
+        pyr_fx[lv] = fx * scale
+        pyr_fy[lv] = fy * scale
+        pyr_cx[lv] = cx * scale
+        pyr_cy[lv] = cy * scale
+
+    return pyr_curr, pyr_ref, pyr_grad_x, pyr_grad_y, pyr_fx, pyr_fy, pyr_cx, pyr_cy
 
 
 # ============================================================================
@@ -552,7 +609,7 @@ def _warp_uv(u, v, rho, R, t, fx, fy, cx, cy):
 
 
 @numba.jit(nopython=True)
-def _patch_residual_jacobian(
+def _patch_residual_jacobian_level(
     cu, cv, rho, half,
     R, t,
     fx, fy, cx, cy,
@@ -560,13 +617,9 @@ def _patch_residual_jacobian(
     huber_delta,
     sigma_photo_sq, sigma_warp_sq,
 ):
-    """Compute GN gradient and Hessian via analytical Jacobian.
+    """Compute GN gradient and Hessian for one pyramid level.
 
-    J_rho = grad_I^T @ d(u_ref)/d(rho)
-
-    Image gradients are sampled from precomputed gradient images.
-
-    Returns (gradient, hessian, mean_residual, n_valid).
+    Returns (gradient, hessian, sum_abs_res, n_valid).
     """
     grad = 0.0
     hess = 0.0
@@ -579,7 +632,13 @@ def _patch_residual_jacobian(
         for dx in range(-half, half):
             pu = float(cu + dx)
             pv = float(cv + dy)
-            i_curr = curr_img[int(pv), int(pu)]
+
+            ipu = int(pv)
+            ipv = int(pu)
+            if ipu < 0 or ipu >= curr_img.shape[0] or ipv < 0 or ipv >= curr_img.shape[1]:
+                continue
+
+            i_curr = curr_img[ipu, ipv]
 
             x_n = (pu - cx) / fx
             y_n = (pv - cy) / fy
@@ -602,13 +661,11 @@ def _patch_residual_jacobian(
             if not svalid:
                 continue
 
-            # Sample precomputed gradients at warped location
             gx, gx_valid = _sample_ref(u_ref, v_ref, ref_grad_x)
             gy, gy_valid = _sample_ref(u_ref, v_ref, ref_grad_y)
             if not (gx_valid and gy_valid):
                 continue
 
-            # d(p_ref)/d(rho) = R @ [-x_n, -y_n, -1] / rho^2
             dpx = -(R[0, 0] * x_n + R[0, 1] * y_n + R[0, 2]) / rho_sq
             dpy = -(R[1, 0] * x_n + R[1, 1] * y_n + R[1, 2]) / rho_sq
             dpz = -(R[2, 0] * x_n + R[2, 1] * y_n + R[2, 2]) / rho_sq
@@ -636,6 +693,50 @@ def _patch_residual_jacobian(
             sum_abs_res += ar
             n_valid += 1
 
+    return grad, hess, sum_abs_res, n_valid
+
+
+@numba.jit(nopython=True)
+def _patch_residual_jacobian(
+    cu, cv, rho, half,
+    R, t,
+    pyr_curr, pyr_ref, pyr_grad_x, pyr_grad_y,
+    pyr_fx, pyr_fy, pyr_cx, pyr_cy,
+    n_levels,
+    huber_delta,
+    sigma_photo_sq, sigma_warp_sq,
+):
+    """Accumulate GN gradient and Hessian across all pyramid levels.
+
+    Patch center (cu, cv) is in level-0 (finest) coordinates.
+    Each coarser level scales coordinates by 0.5.
+
+    Returns (gradient, hessian, mean_residual, n_valid).
+    """
+    grad = 0.0
+    hess = 0.0
+    sum_abs_res = 0.0
+    n_valid = 0
+
+    for lv in range(n_levels):
+        scale = 1.0 / (1 << lv)
+        lv_cu = cu * scale
+        lv_cv = cv * scale
+        lv_half = max(half >> lv, 2)
+
+        g, h, sar, nv = _patch_residual_jacobian_level(
+            lv_cu, lv_cv, rho, lv_half,
+            R, t,
+            pyr_fx[lv], pyr_fy[lv], pyr_cx[lv], pyr_cy[lv],
+            pyr_curr[lv], pyr_ref[lv], pyr_grad_x[lv], pyr_grad_y[lv],
+            huber_delta,
+            sigma_photo_sq, sigma_warp_sq,
+        )
+        grad += g
+        hess += h
+        sum_abs_res += sar
+        n_valid += nv
+
     mean_res = sum_abs_res / max(n_valid, 1)
     return grad, hess, mean_res, n_valid
 
@@ -645,9 +746,10 @@ def _solve_one_patch(
     cu, cv,
     seed_uv, seed_rho, seed_var,
     seed_grid_ids, seed_grid_starts, seed_grid_cols,
-    curr_img, ref_img, ref_grad_x, ref_grad_y,
+    pyr_curr, pyr_ref, pyr_grad_x, pyr_grad_y,
+    pyr_fx, pyr_fy, pyr_cx, pyr_cy,
+    n_levels,
     R, t,
-    fx, fy, cx, cy,
     half,
     lambda_seed, seed_radius_px, sigma_seed_floor,
     huber_delta,
@@ -665,7 +767,6 @@ def _solve_one_patch(
     STATUS_PHOTO_REFINED = 2
     STATUS_REJECTED = 3
 
-    H_img = curr_img.shape[0]
     n_total_cells = seed_grid_starts.shape[0] - 1
     n_grid_rows = n_total_cells // seed_grid_cols
 
@@ -719,10 +820,13 @@ def _solve_one_patch(
     final_curvature = 0.0
 
     for it in range(n_gn_iters):
+        # Accumulate photometric gradient/Hessian across all pyramid levels
         grad_photo, hess_photo, mean_res, nv = _patch_residual_jacobian(
             cu, cv, rho, half,
-            R, t, fx, fy, cx, cy,
-            curr_img, ref_img, ref_grad_x, ref_grad_y,
+            R, t,
+            pyr_curr, pyr_ref, pyr_grad_x, pyr_grad_y,
+            pyr_fx, pyr_fy, pyr_cx, pyr_cy,
+            n_levels,
             huber_delta,
             sigma_photo_sq, sigma_warp_sq,
         )
@@ -815,9 +919,10 @@ def _solve_all_patches(
     patch_residual, patch_curvature,
     seed_uv, seed_rho, seed_var,
     seed_grid_ids, seed_grid_starts, seed_grid_cols,
-    curr_img, ref_img, ref_grad_x, ref_grad_y,
+    pyr_curr, pyr_ref, pyr_grad_x, pyr_grad_y,
+    pyr_fx, pyr_fy, pyr_cx, pyr_cy,
+    n_levels,
     R, t,
-    fx, fy, cx, cy,
     patch_size, lambda_seed, seed_radius_px,
     sigma_seed_floor,
     huber_delta,
@@ -836,9 +941,10 @@ def _solve_all_patches(
             cu, cv,
             seed_uv, seed_rho, seed_var,
             seed_grid_ids, seed_grid_starts, seed_grid_cols,
-            curr_img, ref_img, ref_grad_x, ref_grad_y,
+            pyr_curr, pyr_ref, pyr_grad_x, pyr_grad_y,
+            pyr_fx, pyr_fy, pyr_cx, pyr_cy,
+            n_levels,
             R, t,
-            fx, fy, cx, cy,
             half,
             lambda_seed, seed_radius_px, sigma_seed_floor,
             huber_delta,

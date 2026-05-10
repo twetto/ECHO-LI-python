@@ -10,7 +10,7 @@ GIFT:
   maxFeatures: 1500
   maxLevel: 3
   # minHarrisQuality: 0.05
-  minHarrisQuality: 0.005
+  minHarrisQuality: 0.01
   ransacParams:
     inlierThreshold: 0.003
     # maxIterations: 30
@@ -164,9 +164,13 @@ SparseVog:
   max_depth: 100.0
   # PlaneDetector (separate instance, fed by sparse_vog pool)
   pd_max_tri_side_px: 200
-  pd_max_dist_between_z: 0.15
-  pd_max_norm_deg: 25
-  pd_min_plane_features: 4
+  # pd_max_tri_side_px: 64
+  pd_max_dist_between_z: 0.1
+  # pd_max_dist_between_z: 0.1
+  # pd_max_norm_deg: 25
+  pd_max_norm_deg: 10
+  # pd_min_plane_features: 4
+  pd_min_plane_features: 15
 PatchDepth:
   scale: 1.0
   patch_size: 8
@@ -175,3 +179,4 @@ PatchDepth:
   seed_radius_px: 32
   min_baseline_ratio: 0.005
   max_baseline_ratio: 0.3
+  n_pyramid_levels: 1

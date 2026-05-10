@@ -284,10 +284,11 @@ def main():
     plane_detector = None
     if args.planes:
         plane_detector = PlaneDetector(PlaneDetectorSettings(
-            max_tri_side_px=250,
-            max_dist_between_z=0.1,
-            #max_norm_deg=5))
-            max_norm_deg=180))
+            # max_tri_side_px=250,
+            max_tri_side_px=16,
+            max_dist_between_z=0.001,
+            max_norm_deg=0.1))
+            # max_norm_deg=180))
         print("Plane detection enabled")
 
     # Initialize FlowDep dense depth filter
@@ -478,6 +479,7 @@ def main():
                     n_gn_iters=int(patch_depth_cfg.get('n_gn_iters', 5)),
                     min_baseline_ratio=float(patch_depth_cfg.get('min_baseline_ratio', 0.005)),
                     min_photo_curvature=float(patch_depth_cfg.get('min_photo_curvature', 1e-6)),
+                    n_pyramid_levels=int(patch_depth_cfg.get('n_pyramid_levels', 1)),
                 ),
             )
             print(f"Patch-grid depth mapper enabled "
