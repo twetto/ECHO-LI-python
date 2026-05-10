@@ -173,3 +173,5 @@ PatchDepth:
   patch_stride: 4
   cell_size: 8
   seed_radius_px: 32
+  min_baseline_ratio: 0.005
+  max_baseline_ratio: 0.3

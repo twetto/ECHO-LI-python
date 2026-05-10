@@ -1,9 +1,11 @@
 """
 Patch-grid direct depth mapper with sparse GB priors.
 
-Per-frame stateless densifier: lays a grid of patch centers on the current
-image, optimises a scalar inverse-depth per patch via photometric + sparse-seed
-cost, then fuses overlapping patches into output cells.
+Lays a grid of patch centers on the current image, optimises a scalar
+inverse-depth per patch via photometric + sparse-seed cost, then fuses
+overlapping patches into output cells.  Maintains a 2-keyframe buffer
+internally; the caller just feeds each new frame and the mapper picks
+the best reference.
 
 See docs/patch_grid_direct_depth_guide.md for the design rationale.
 """
@@ -53,6 +55,7 @@ class PatchDepthSettings:
 
     # Photometric
     photo_huber_delta: float = 5.0
+    sigma_photo: float = 5.0
     n_gn_iters: int = 5
     fd_eps: float = 1e-3
 
@@ -64,6 +67,10 @@ class PatchDepthSettings:
     # Discrete search around seed init
     n_search_candidates: int = 5
     search_half_range: float = 0.5
+
+    # Keyframe management (fraction of median seed depth)
+    min_baseline_ratio: float = 0.005
+    max_baseline_ratio: float = 0.3
 
     # Status thresholds
     min_photo_curvature: float = 1e-6
@@ -80,7 +87,7 @@ class PatchDepthSettings:
 # ============================================================================
 
 class PatchDepthMapper:
-    """Per-frame patch-grid direct depth mapper."""
+    """Patch-grid direct depth mapper with 2-keyframe buffer."""
 
     def __init__(
         self,
@@ -99,6 +106,8 @@ class PatchDepthMapper:
         if self.s.patch_size < self.s.cell_size:
             raise ValueError("patch_size must be >= cell_size")
 
+        self._keyframes: list[tuple[np.ndarray, np.ndarray]] = []
+
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
@@ -107,27 +116,147 @@ class PatchDepthMapper:
         self,
         sparse_vog: FilterT,
         curr_gray: np.ndarray,
-        ref_gray: np.ndarray,
-        T_ref_curr: np.ndarray,
-    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        T_WC: np.ndarray,
+        P_vv: Optional[np.ndarray] = None,
+        dt: float = 0.0,
+    ) -> Optional[tuple[np.ndarray, np.ndarray, np.ndarray]]:
         """Run one frame of patch-grid direct depth.
 
         Args:
             sparse_vog: sparse Vogiatzis filter with current-frame seeds
             curr_gray:  (H, W) float32 current undistorted grayscale
-            ref_gray:   (H, W) float32 reference undistorted grayscale
-            T_ref_curr: (4, 4) SE(3) transform from current to reference frame
+            T_WC:       (4, 4) SE(3) camera-to-world pose
+            P_vv:       (3,3) or (6,6) velocity covariance (optional)
+            dt:         time since last frame (for P_vv scaling)
 
         Returns:
-            depth_cells:  (Hc, Wc) float32 cell depth (NaN = unknown)
-            var_cells:    (Hc, Wc) float32 cell inv-depth variance
-            status_cells: (Hc, Wc) int32 PatchStatus enum
+            None if no keyframe with sufficient baseline is available, else
+            (depth_cells, var_cells, status_cells).
         """
+        s = self.s
+
+        # Gather seeds early so we can compute median depth for baseline check
+        seed_uv, seed_rho, seed_var = self._gather_seeds(sparse_vog)
+        if seed_rho.shape[0] > 0:
+            median_depth = 1.0 / float(np.median(seed_rho))
+        else:
+            median_depth = s.max_depth
+
+        # Pick best keyframe: largest baseline that's still within bounds
+        ref_gray, T_ref_curr = self._select_keyframe(T_WC, median_depth)
+
+        # Update keyframe buffer
+        self._manage_keyframes(curr_gray, T_WC, median_depth)
+
+        if ref_gray is None:
+            return None
+
+        # Compute sigma_warp_sq from pose uncertainty
+        sigma_warp_sq = self._compute_sigma_warp_sq(
+            T_ref_curr, P_vv, dt, median_depth,
+        )
+
+        return self._solve(
+            curr_gray, ref_gray, T_ref_curr,
+            seed_uv, seed_rho, seed_var, median_depth,
+            sigma_warp_sq,
+        )
+
+    # ------------------------------------------------------------------
+    # Keyframe management
+    # ------------------------------------------------------------------
+
+    def _select_keyframe(
+        self, T_WC: np.ndarray, median_depth: float,
+    ) -> tuple[Optional[np.ndarray], Optional[np.ndarray]]:
+        """Pick the keyframe with the largest usable baseline."""
+        s = self.s
+        min_bl = s.min_baseline_ratio * median_depth
+        max_bl = s.max_baseline_ratio * median_depth
+
+        best_kf = None
+        best_baseline = -1.0
+
+        T_CW = np.linalg.inv(T_WC)
+        for kf_gray, kf_T_WC in self._keyframes:
+            T_ref_curr = np.linalg.inv(kf_T_WC) @ T_WC
+            baseline = float(np.linalg.norm(T_ref_curr[:3, 3]))
+            if baseline >= min_bl and baseline <= max_bl and baseline > best_baseline:
+                best_kf = (kf_gray, T_ref_curr)
+                best_baseline = baseline
+
+        if best_kf is None:
+            return None, None
+        return best_kf
+
+    def _manage_keyframes(
+        self, curr_gray: np.ndarray, T_WC: np.ndarray, median_depth: float,
+    ):
+        """Maintain 2 keyframes: push current frame, evict oldest if full."""
+        s = self.s
+        min_bl = s.min_baseline_ratio * median_depth
+
+        if len(self._keyframes) < 2:
+            self._keyframes.append((curr_gray.copy(), T_WC.copy()))
+            return
+
+        newest_T_WC = self._keyframes[-1][1]
+        bl_from_newest = float(np.linalg.norm(
+            (np.linalg.inv(newest_T_WC) @ T_WC)[:3, 3]
+        ))
+        if bl_from_newest >= min_bl:
+            self._keyframes.pop(0)
+            self._keyframes.append((curr_gray.copy(), T_WC.copy()))
+
+    # ------------------------------------------------------------------
+    # Pose-uncertainty weighting
+    # ------------------------------------------------------------------
+
+    def _compute_sigma_warp_sq(
+        self,
+        T_ref_curr: np.ndarray,
+        P_vv: Optional[np.ndarray],
+        dt: float,
+        median_depth: float,
+    ) -> float:
+        """Pixel-space warp variance from velocity covariance.
+
+        sigma_warp^2 = (f/z)^2 * (t_hat^T P_vv_trans t_hat) * dt^2
+        """
+        if P_vv is None or dt <= 0.0:
+            return 0.0
+
+        P_vv_trans = P_vv[3:6, 3:6] if P_vv.shape == (6, 6) else P_vv
+        t = T_ref_curr[:3, 3]
+        t_norm_sq = float(t @ t)
+        if t_norm_sq < 1e-16:
+            return 0.0
+
+        t_hat = t / np.sqrt(t_norm_sq)
+        var_t_mag = dt * dt * float(t_hat @ P_vv_trans @ t_hat)
+        f = 0.5 * (self.fx + self.fy)
+        sigma_warp_sq = (f / median_depth) ** 2 * var_t_mag
+        return float(sigma_warp_sq)
+
+    # ------------------------------------------------------------------
+    # Core solve
+    # ------------------------------------------------------------------
+
+    def _solve(
+        self,
+        curr_gray: np.ndarray,
+        ref_gray: np.ndarray,
+        T_ref_curr: np.ndarray,
+        seed_uv: np.ndarray,
+        seed_rho: np.ndarray,
+        seed_var: np.ndarray,
+        median_depth: float,
+        sigma_warp_sq: float = 0.0,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         s = self.s
         H_orig, W_orig = curr_gray.shape[:2]
         sc = s.scale
 
-        # 0. Downscale images and adjust intrinsics
         if sc < 1.0:
             import cv2
             H = int(H_orig * sc + 0.5)
@@ -148,20 +277,16 @@ class PatchDepthMapper:
             ref_f32 = ref_gray.astype(np.float32)
             fx, fy, cx, cy = self.fx, self.fy, self.cx, self.cy
 
-        # 1. Gather sparse seeds as (M, 2) pixel, (M,) inv-depth, (M,) inv-depth var
-        seed_uv, seed_rho, seed_var = self._gather_seeds(sparse_vog)
         if sc < 1.0 and seed_uv.shape[0] > 0:
             seed_uv = seed_uv * sc
 
-        # 2. Build patch grid centers in scaled frame
         half = s.patch_size // 2
         grid_u = np.arange(half, W - half, s.patch_stride, dtype=np.float64)
         grid_v = np.arange(half, H - half, s.patch_stride, dtype=np.float64)
         gu, gv = np.meshgrid(grid_u, grid_v)
-        patch_centers = np.stack([gu.ravel(), gv.ravel()], axis=1)  # (N, 2)
+        patch_centers = np.stack([gu.ravel(), gv.ravel()], axis=1)
         N = patch_centers.shape[0]
 
-        # 3. For each patch, find nearby seeds and initialise
         patch_rho = np.full(N, np.nan, dtype=np.float64)
         patch_var = np.full(N, np.inf, dtype=np.float64)
         patch_status = np.full(N, PatchStatus.UNKNOWN, dtype=np.int32)
@@ -175,6 +300,7 @@ class PatchDepthMapper:
         rho_max = 1.0 / s.min_depth
 
         seed_radius_scaled = s.seed_radius_px * sc if sc < 1.0 else s.seed_radius_px
+        sigma_photo_sq = s.sigma_photo * s.sigma_photo
 
         _solve_all_patches(
             patch_centers, patch_rho, patch_var, patch_status,
@@ -189,10 +315,11 @@ class PatchDepthMapper:
             s.n_search_candidates, s.search_half_range,
             s.n_gn_iters,
             rho_min, rho_max,
-            s.min_photo_curvature, s.max_photo_residual,
+            s.min_photo_curvature * s.patch_size * s.patch_size,
+            s.max_photo_residual,
+            sigma_photo_sq, sigma_warp_sq,
         )
 
-        # 4. Fuse patches into output cells
         n_cells_u = max(1, W // s.cell_size)
         n_cells_v = max(1, H // s.cell_size)
         depth_cells, var_cells, status_cells = _fuse_cells(
@@ -329,18 +456,56 @@ def _patch_cost(
 
 
 @numba.jit(nopython=True)
+def _sample_ref(u_ref, v_ref, ref_img):
+    """Bilinear sample from ref_img at (u_ref, v_ref). Returns (val, valid)."""
+    H, W = ref_img.shape
+    ix = int(u_ref)
+    iy = int(v_ref)
+    if ix < 0 or ix >= W - 1 or iy < 0 or iy >= H - 1:
+        return 0.0, False
+    dx = u_ref - ix
+    dy = v_ref - iy
+    val = (
+        (1.0 - dx) * (1.0 - dy) * ref_img[iy, ix]
+        + dx * (1.0 - dy) * ref_img[iy, ix + 1]
+        + (1.0 - dx) * dy * ref_img[iy + 1, ix]
+        + dx * dy * ref_img[iy + 1, ix + 1]
+    )
+    return val, True
+
+
+@numba.jit(nopython=True)
+def _warp_uv(u, v, rho, R, t, fx, fy, cx, cy):
+    """Warp pixel (u,v) at inv-depth rho, return (u_ref, v_ref, valid)."""
+    x_n = (u - cx) / fx
+    y_n = (v - cy) / fy
+    qx = x_n / rho
+    qy = y_n / rho
+    qz = 1.0 / rho
+    rx = R[0, 0] * qx + R[0, 1] * qy + R[0, 2] * qz + t[0]
+    ry = R[1, 0] * qx + R[1, 1] * qy + R[1, 2] * qz + t[1]
+    rz = R[2, 0] * qx + R[2, 1] * qy + R[2, 2] * qz + t[2]
+    if rz <= 1e-6:
+        return 0.0, 0.0, False
+    u_ref = fx * rx / rz + cx
+    v_ref = fy * ry / rz + cy
+    return u_ref, v_ref, True
+
+
+@numba.jit(nopython=True)
 def _patch_residual_jacobian(
     cu, cv, rho, half,
     R, t,
     fx, fy, cx, cy,
     curr_img, ref_img,
     huber_delta, fd_eps,
+    sigma_photo_sq, sigma_warp_sq,
 ):
     """Compute GN gradient and Hessian via finite-difference Jacobian.
 
     Returns (gradient, hessian, mean_residual, n_valid).
-    gradient = sum_p w_p * J_p * r_p
-    hessian  = sum_p w_p * J_p^2
+    Per-pixel weight: w_huber / sigma_eff_i^2
+    where sigma_eff_i^2 = sigma_photo^2 + ||grad_I_i||^2 * sigma_warp^2
     """
     grad = 0.0
     hess = 0.0
@@ -356,10 +521,13 @@ def _patch_residual_jacobian(
             pv = float(cv + dy)
             i_curr = curr_img[int(pv), int(pu)]
 
-            i_ref, valid = _warp_and_sample(
-                pu, pv, rho, R, t, fx, fy, cx, cy, ref_img,
+            u_ref, v_ref, warp_valid = _warp_uv(
+                pu, pv, rho, R, t, fx, fy, cx, cy,
             )
-            if not valid:
+            if not warp_valid:
+                continue
+            i_ref, svalid = _sample_ref(u_ref, v_ref, ref_img)
+            if not svalid:
                 continue
 
             i_ref_p, vp = _warp_and_sample(
@@ -374,11 +542,25 @@ def _patch_residual_jacobian(
             r = i_ref - i_curr
             J = (i_ref_p - i_ref_m) / (2.0 * fd_eps)
 
+            # Per-pixel effective noise: sigma_eff^2 = sigma_photo^2 + ||grad_I||^2 * sigma_warp^2
+            grad_I_sq = 0.0
+            if sigma_warp_sq > 0.0:
+                iu_p, _ = _sample_ref(u_ref + 1.0, v_ref, ref_img)
+                iu_m, _ = _sample_ref(u_ref - 1.0, v_ref, ref_img)
+                iv_p, _ = _sample_ref(u_ref, v_ref + 1.0, ref_img)
+                iv_m, _ = _sample_ref(u_ref, v_ref - 1.0, ref_img)
+                gx = (iu_p - iu_m) * 0.5
+                gy = (iv_p - iv_m) * 0.5
+                grad_I_sq = gx * gx + gy * gy
+
+            sigma_eff_sq = sigma_photo_sq + grad_I_sq * sigma_warp_sq
+            inv_sigma_eff_sq = 1.0 / sigma_eff_sq
+
             ar = abs(r)
             if ar <= huber_delta:
-                w = 1.0
+                w = inv_sigma_eff_sq
             else:
-                w = huber_delta / ar
+                w = inv_sigma_eff_sq * huber_delta / ar
 
             grad += w * J * r
             hess += w * J * J
@@ -403,6 +585,7 @@ def _solve_one_patch(
     n_gn_iters,
     rho_min, rho_max,
     min_curvature, max_residual,
+    sigma_photo_sq, sigma_warp_sq,
 ):
     """Solve inverse depth for a single patch.
 
@@ -490,6 +673,7 @@ def _solve_one_patch(
             R, t, fx, fy, cx, cy,
             curr_img, ref_img,
             huber_delta, fd_eps,
+            sigma_photo_sq, sigma_warp_sq,
         )
         if nv == 0:
             break
@@ -539,6 +723,42 @@ def _solve_one_patch(
 
 
 @numba.jit(nopython=True, parallel=True)
+def _seed_only_all_patches(
+    patch_centers, patch_rho, patch_var, patch_status,
+    seed_uv, seed_rho, seed_var,
+    seed_radius_px, sigma_seed_floor,
+    lambda_seed,
+):
+    """Assign seed-only depth to all patches (no photometric refinement)."""
+    STATUS_UNKNOWN = 0
+    STATUS_SEED_ONLY = 1
+    N = patch_centers.shape[0]
+    M = seed_uv.shape[0]
+    for i in numba.prange(N):
+        cu = patch_centers[i, 0]
+        cv = patch_centers[i, 1]
+        rho_acc = 0.0
+        prec_acc = 0.0
+        for m in range(M):
+            du = seed_uv[m, 0] - cu
+            dv = seed_uv[m, 1] - cv
+            dist = (du * du + dv * dv) ** 0.5
+            if dist > seed_radius_px:
+                continue
+            w_spatial = 1.0 - dist / seed_radius_px
+            var_capped = max(seed_var[m], sigma_seed_floor * sigma_seed_floor)
+            prec = w_spatial * lambda_seed / var_capped
+            rho_acc += prec * seed_rho[m]
+            prec_acc += prec
+        if prec_acc > 0.0:
+            patch_rho[i] = rho_acc / prec_acc
+            patch_var[i] = 1.0 / prec_acc
+            patch_status[i] = STATUS_SEED_ONLY
+        else:
+            patch_status[i] = STATUS_UNKNOWN
+
+
+@numba.jit(nopython=True, parallel=True)
 def _solve_all_patches(
     patch_centers, patch_rho, patch_var, patch_status,
     patch_residual, patch_curvature,
@@ -553,6 +773,7 @@ def _solve_all_patches(
     n_gn_iters,
     rho_min, rho_max,
     min_curvature, max_residual,
+    sigma_photo_sq, sigma_warp_sq,
 ):
     """Solve all patches in parallel."""
     N = patch_centers.shape[0]
@@ -573,6 +794,7 @@ def _solve_all_patches(
             n_gn_iters,
             rho_min, rho_max,
             min_curvature, max_residual,
+            sigma_photo_sq, sigma_warp_sq,
         )
         patch_rho[i] = rho
         patch_var[i] = var

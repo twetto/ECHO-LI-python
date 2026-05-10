@@ -445,8 +445,7 @@ def main():
     # Patch-grid direct depth mapper
     patch_depth_mapper = None
     patch_depth_debug = None
-    patch_depth_prev_gray = None
-    patch_depth_prev_T_WC = None
+    patch_depth_prev_stamp = -1.0
     if args.patch_depth:
         if sparse_vog_filter is None:
             print("WARNING: --patch-depth requires --sparse-vog; disabled")
@@ -477,6 +476,8 @@ def main():
                     seed_radius_px=float(patch_depth_cfg.get('seed_radius_px', 32.0)),
                     sigma_seed_floor=float(patch_depth_cfg.get('sigma_seed_floor', 0.01)),
                     n_gn_iters=int(patch_depth_cfg.get('n_gn_iters', 5)),
+                    min_baseline_ratio=float(patch_depth_cfg.get('min_baseline_ratio', 0.005)),
+                    min_photo_curvature=float(patch_depth_cfg.get('min_photo_curvature', 1e-6)),
                 ),
             )
             print(f"Patch-grid depth mapper enabled "
@@ -699,32 +700,29 @@ def main():
             # Patch-grid direct depth
             if patch_depth_mapper is not None and sparse_vog_filter is not None:
                 T_WC_pd = (state.sensor.pose * state.sensor.camera_offset).asMatrix()
-                image_pd = cv2.remap(image, patch_mapx, patch_mapy, cv2.INTER_LINEAR)
+                P_vv_pd = vio_filter.get_velocity_cov()
+                pd_dt = max(stamp - patch_depth_prev_stamp, 0.0) if patch_depth_prev_stamp >= 0 else 0.0
+                patch_depth_prev_stamp = stamp
+                eq_image = tracker._previous_image
+                image_pd = cv2.remap(eq_image, patch_mapx, patch_mapy, cv2.INTER_LINEAR)
                 image_pd_f32 = image_pd.astype(np.float32)
-                if patch_depth_prev_gray is not None:
-                    timer.start("patch_depth")
-                    # T_ref_curr: maps current-frame 3D points to reference frame
-                    # p_ref = T_ref_curr @ p_curr
-                    T_ref_curr = np.linalg.inv(patch_depth_prev_T_WC) @ T_WC_pd
-                    pd_depth, pd_var, pd_status = patch_depth_mapper.update(
-                        sparse_vog_filter,
-                        image_pd_f32,
-                        patch_depth_prev_gray,
-                        T_ref_curr,
+                timer.start("patch_depth")
+                result = patch_depth_mapper.update(
+                    sparse_vog_filter, image_pd_f32, T_WC_pd,
+                    P_vv=P_vv_pd, dt=pd_dt,
+                )
+                timer.stop("patch_depth")
+                if result is not None and patch_depth_debug is not None:
+                    pd_depth, pd_var, pd_status = result
+                    n_seeds = sum(
+                        1 for fid in sparse_vog_filter.feat_uvs
+                        if sparse_vog_filter.query(fid)[0] > 0
                     )
-                    timer.stop("patch_depth")
-                    if patch_depth_debug is not None:
-                        n_seeds = sum(
-                            1 for fid in sparse_vog_filter.feat_uvs
-                            if sparse_vog_filter.query(fid)[0] > 0
-                        )
-                        patch_depth_debug.update(
-                            pd_depth, pd_var, pd_status, n_seeds=n_seeds,
-                        )
-                        if not patch_depth_debug.enabled:
-                            break
-                patch_depth_prev_gray = image_pd_f32
-                patch_depth_prev_T_WC = T_WC_pd.copy()
+                    patch_depth_debug.update(
+                        pd_depth, pd_var, pd_status, n_seeds=n_seeds,
+                    )
+                    if not patch_depth_debug.enabled:
+                        break
 
             # Camera debug window
             if cam_debug is not None:

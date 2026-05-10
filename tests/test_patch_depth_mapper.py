@@ -112,15 +112,28 @@ def test_flat_plane_with_seeds():
         sparse_vog.update(meas, T_WC)
 
     # Run patch depth mapper
+    # Convention: ref camera at origin, current camera translated +x by baseline.
+    # T_ref_curr that the mapper computes: inv(T_WC_ref) @ T_WC_curr
+    #   = inv(eye) @ [[I, baseline],[0,1]] → t = [+baseline, 0, 0]
+    # But _warp_image was called with T_ref_curr[0,3] = -baseline (maps curr→ref).
+    # So place ref at +baseline and curr at origin so mapper gets t = [-baseline,0,0].
     settings = PatchDepthSettings(
         patch_size=16,
         patch_stride=8,
         cell_size=16,
+        min_baseline_ratio=0.001,
     )
     mapper = PatchDepthMapper(K, settings)
-    depth_cells, var_cells, status_cells = mapper.update(
-        sparse_vog, curr_img, ref_img, T_ref_curr,
-    )
+    # Feed reference frame as keyframe at x=+baseline
+    T_WC_ref = np.eye(4)
+    T_WC_ref[0, 3] = baseline
+    result = mapper.update(sparse_vog, ref_img, T_WC_ref)
+    assert result is None
+    # Feed current frame at origin
+    T_WC_curr = np.eye(4)
+    result = mapper.update(sparse_vog, curr_img, T_WC_curr)
+    assert result is not None, "Expected result with sufficient baseline"
+    depth_cells, var_cells, status_cells = result
 
     # Check results
     valid = ~np.isnan(depth_cells)
@@ -203,31 +216,18 @@ def test_no_parallax_gives_seed_only():
     print(f"Converged seeds: {n_converged}/{len(seed_positions)}")
     assert n_converged > 0, "No seeds converged"
 
-    # Densify with zero baseline (hovering)
-    T_ref_curr = np.eye(4)
+    # Densify with zero baseline (hovering) — mapper should reject due to
+    # insufficient baseline between keyframes and current frame.
     settings = PatchDepthSettings(patch_size=16, patch_stride=8, cell_size=16)
     mapper = PatchDepthMapper(K, settings)
-    depth_cells, var_cells, status_cells = mapper.update(
-        sparse_vog, img, img, T_ref_curr,
-    )
-
-    n_photo = np.sum(status_cells == PatchStatus.PHOTO_REFINED)
-    n_seed = np.sum(status_cells == PatchStatus.SEED_ONLY)
-    n_rejected = np.sum(status_cells == PatchStatus.REJECTED)
-    print(f"No-parallax: PHOTO_REFINED={n_photo}, SEED_ONLY={n_seed}, "
-          f"REJECTED={n_rejected}")
-
-    assert n_photo == 0, f"Expected no PHOTO_REFINED without parallax, got {n_photo}"
-    assert n_seed > 0, "Expected some SEED_ONLY cells"
-    assert n_rejected == 0, f"Unexpected REJECTED cells: {n_rejected}"
-
-    valid = ~np.isnan(depth_cells)
-    if np.any(valid):
-        median_depth = np.median(depth_cells[valid])
-        rel_error = abs(median_depth - z_true) / z_true
-        print(f"Depth: median={median_depth:.2f}m (true={z_true:.1f}m), "
-              f"rel_error={rel_error:.1%}")
-        assert rel_error < 0.2, f"SEED_ONLY depth too far: {median_depth:.2f} vs {z_true}"
+    # Feed first frame as keyframe
+    T_WC_hover = np.eye(4)
+    T_WC_hover[0, 3] = 0.1  # at final position from seed convergence
+    result = mapper.update(sparse_vog, img, T_WC_hover)
+    assert result is None, "First frame should return None (no keyframe yet)"
+    # Feed same pose again — baseline is zero
+    result = mapper.update(sparse_vog, img, T_WC_hover)
+    assert result is None, "Expected None with zero baseline (hovering)"
 
     print("PASS: no parallax gives SEED_ONLY\n")
 

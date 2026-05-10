@@ -569,3 +569,58 @@ avoidance:
 The key visual diagnostic is not whether every pixel is filled. It is whether
 unknown, seed-only, and photo-refined regions are distinguishable and
 behave predictably.
+
+## Implemented Improvements (2026-05-10)
+
+### Keyframe Management
+
+The mapper maintains a 2-keyframe buffer internally. Each frame, it selects the
+keyframe with the largest baseline within `[min_baseline_ratio, max_baseline_ratio]
+* median_seed_depth`. When no keyframe has sufficient baseline, it returns None
+(no output). Keyframes are replaced when the newest one accumulates enough
+baseline from the current frame.
+
+This greatly reduces whole-frame failures from weak parallax. The per-patch
+status logic (H_photo curvature check) still determines whether each patch
+yields PHOTO_REFINED or SEED_ONLY output.
+
+### Pose-Uncertainty-Weighted Photometric Cost (R_eff)
+
+Per-pixel effective noise inflated by velocity covariance from EqVIO:
+
+```
+sigma_eff_i^2 = sigma_photo^2 + ||grad_I_i||^2 * sigma_warp^2
+sigma_warp^2  = (f / z_median)^2 * dt^2 * (t_hat^T P_vv_trans t_hat)
+```
+
+Each pixel's GN weight becomes `w_huber / sigma_eff_i^2`. High-gradient pixels
+under uncertain pose are naturally downweighted; the seed prior dominates when
+photometric information is unreliable.
+
+This separates two failure modes: weak parallax (small J_rho → low curvature →
+seed-only fallback) and uncertain pose (large R_eff → photometric downweighted →
+seed prior dominates). Note: the formula is a first-order approximation — it
+ignores rotation uncertainty and assumes the covariance frame aligns with the
+translation direction. Adequate for robustness, not a full covariance
+propagation.
+
+### Histogram Equalization
+
+Images are grabbed from GIFT's internal histogram-equalized buffer
+(`tracker._previous_image`) to handle auto-exposure shifts between frames.
+
+## Future Work (if experiments require)
+
+### Coarse-to-Fine Pyramid
+
+Solve at coarse scale first for a wide basin of convergence, then refine at
+finer scales. Reduces repetitive-texture ambiguity and handles larger
+inter-frame displacements.
+
+### Analytic Jacobian / Efficient Formulation
+
+Replace finite-difference Jacobian with the closed-form `dI/drho = grad_I^T *
+d(u_ref)/drho`. Eliminates 2 extra warp-and-sample calls per pixel per GN
+iteration. An inverse-compositional-style approximation may further amortise
+cost across iterations, though the depth warp Jacobian is not strictly constant
+(it depends on both T_ref_curr and the current rho estimate).
