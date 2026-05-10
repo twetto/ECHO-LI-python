@@ -302,17 +302,28 @@ class PatchDepthMapper:
         seed_radius_scaled = s.seed_radius_px * sc if sc < 1.0 else s.seed_radius_px
         sigma_photo_sq = s.sigma_photo * s.sigma_photo
 
+        # Precompute reference image gradients (central difference)
+        ref_grad_x = np.zeros_like(ref_f32)
+        ref_grad_y = np.zeros_like(ref_f32)
+        ref_grad_x[:, 1:-1] = (ref_f32[:, 2:] - ref_f32[:, :-2]) * 0.5
+        ref_grad_y[1:-1, :] = (ref_f32[2:, :] - ref_f32[:-2, :]) * 0.5
+
+        # Build spatial grid for seed lookup
+        seed_grid_ids, seed_grid_starts, seed_grid_cols = _build_seed_grid(
+            seed_uv, seed_radius_scaled, W, H,
+        )
+
         _solve_all_patches(
             patch_centers, patch_rho, patch_var, patch_status,
             patch_residual, patch_curvature,
             seed_uv, seed_rho, seed_var,
-            curr_f32, ref_f32,
+            seed_grid_ids, seed_grid_starts, seed_grid_cols,
+            curr_f32, ref_f32, ref_grad_x, ref_grad_y,
             R, t,
             fx, fy, cx, cy,
             s.patch_size, s.lambda_seed, seed_radius_scaled,
             s.sigma_seed_floor,
-            s.photo_huber_delta, s.fd_eps,
-            s.n_search_candidates, s.search_half_range,
+            s.photo_huber_delta,
             s.n_gn_iters,
             rho_min, rho_max,
             s.min_photo_curvature * s.patch_size * s.patch_size,
@@ -366,6 +377,54 @@ class PatchDepthMapper:
             np.array(rhos, dtype=np.float64),
             np.array(vars_, dtype=np.float64),
         )
+
+
+# ============================================================================
+# Seed spatial grid
+# ============================================================================
+
+def _build_seed_grid(
+    seed_uv: np.ndarray,
+    cell_size: float,
+    W: int,
+    H: int,
+) -> tuple[np.ndarray, np.ndarray, int]:
+    """Bin seeds into a spatial grid for O(1) neighborhood lookup.
+
+    Returns:
+        seed_grid_ids:    flat array of seed indices, grouped by cell
+        seed_grid_starts: (n_cells+1,) start index into seed_grid_ids per cell
+        n_cols:           number of grid columns
+    """
+    M = seed_uv.shape[0]
+    n_cols = max(1, int(np.ceil(W / cell_size)))
+    n_rows = max(1, int(np.ceil(H / cell_size)))
+    n_cells = n_rows * n_cols
+
+    # Count seeds per cell
+    counts = np.zeros(n_cells, dtype=np.int64)
+    cell_ids = np.empty(M, dtype=np.int64)
+    for m in range(M):
+        ci = min(int(seed_uv[m, 0] / cell_size), n_cols - 1)
+        cj = min(int(seed_uv[m, 1] / cell_size), n_rows - 1)
+        idx = cj * n_cols + ci
+        cell_ids[m] = idx
+        counts[idx] += 1
+
+    # Build starts array (prefix sum)
+    starts = np.zeros(n_cells + 1, dtype=np.int64)
+    for i in range(n_cells):
+        starts[i + 1] = starts[i] + counts[i]
+
+    # Fill seed ids
+    grid_ids = np.empty(M, dtype=np.int64)
+    offsets = starts[:n_cells].copy()
+    for m in range(M):
+        idx = cell_ids[m]
+        grid_ids[offsets[idx]] = m
+        offsets[idx] += 1
+
+    return grid_ids, starts, n_cols
 
 
 # ============================================================================
@@ -497,23 +556,24 @@ def _patch_residual_jacobian(
     cu, cv, rho, half,
     R, t,
     fx, fy, cx, cy,
-    curr_img, ref_img,
-    huber_delta, fd_eps,
+    curr_img, ref_img, ref_grad_x, ref_grad_y,
+    huber_delta,
     sigma_photo_sq, sigma_warp_sq,
 ):
-    """Compute GN gradient and Hessian via finite-difference Jacobian.
+    """Compute GN gradient and Hessian via analytical Jacobian.
+
+    J_rho = grad_I^T @ d(u_ref)/d(rho)
+
+    Image gradients are sampled from precomputed gradient images.
 
     Returns (gradient, hessian, mean_residual, n_valid).
-    Per-pixel weight: w_huber / sigma_eff_i^2
-    where sigma_eff_i^2 = sigma_photo^2 + ||grad_I_i||^2 * sigma_warp^2
     """
     grad = 0.0
     hess = 0.0
     sum_abs_res = 0.0
     n_valid = 0
 
-    rho_plus = rho + fd_eps
-    rho_minus = rho - fd_eps
+    rho_sq = rho * rho
 
     for dy in range(-half, half):
         for dx in range(-half, half):
@@ -521,38 +581,47 @@ def _patch_residual_jacobian(
             pv = float(cv + dy)
             i_curr = curr_img[int(pv), int(pu)]
 
-            u_ref, v_ref, warp_valid = _warp_uv(
-                pu, pv, rho, R, t, fx, fy, cx, cy,
-            )
-            if not warp_valid:
+            x_n = (pu - cx) / fx
+            y_n = (pv - cy) / fy
+
+            qx = x_n / rho
+            qy = y_n / rho
+            qz = 1.0 / rho
+
+            px = R[0, 0] * qx + R[0, 1] * qy + R[0, 2] * qz + t[0]
+            py = R[1, 0] * qx + R[1, 1] * qy + R[1, 2] * qz + t[1]
+            pz = R[2, 0] * qx + R[2, 1] * qy + R[2, 2] * qz + t[2]
+
+            if pz <= 1e-6:
                 continue
+
+            u_ref = fx * px / pz + cx
+            v_ref = fy * py / pz + cy
+
             i_ref, svalid = _sample_ref(u_ref, v_ref, ref_img)
             if not svalid:
                 continue
 
-            i_ref_p, vp = _warp_and_sample(
-                pu, pv, rho_plus, R, t, fx, fy, cx, cy, ref_img,
-            )
-            i_ref_m, vm = _warp_and_sample(
-                pu, pv, rho_minus, R, t, fx, fy, cx, cy, ref_img,
-            )
-            if not vp or not vm:
+            # Sample precomputed gradients at warped location
+            gx, gx_valid = _sample_ref(u_ref, v_ref, ref_grad_x)
+            gy, gy_valid = _sample_ref(u_ref, v_ref, ref_grad_y)
+            if not (gx_valid and gy_valid):
                 continue
 
+            # d(p_ref)/d(rho) = R @ [-x_n, -y_n, -1] / rho^2
+            dpx = -(R[0, 0] * x_n + R[0, 1] * y_n + R[0, 2]) / rho_sq
+            dpy = -(R[1, 0] * x_n + R[1, 1] * y_n + R[1, 2]) / rho_sq
+            dpz = -(R[2, 0] * x_n + R[2, 1] * y_n + R[2, 2]) / rho_sq
+
+            inv_pz_sq = 1.0 / (pz * pz)
+            du_drho = fx * (dpx * pz - px * dpz) * inv_pz_sq
+            dv_drho = fy * (dpy * pz - py * dpz) * inv_pz_sq
+
+            J = gx * du_drho + gy * dv_drho
+
             r = i_ref - i_curr
-            J = (i_ref_p - i_ref_m) / (2.0 * fd_eps)
 
-            # Per-pixel effective noise: sigma_eff^2 = sigma_photo^2 + ||grad_I||^2 * sigma_warp^2
-            grad_I_sq = 0.0
-            if sigma_warp_sq > 0.0:
-                iu_p, _ = _sample_ref(u_ref + 1.0, v_ref, ref_img)
-                iu_m, _ = _sample_ref(u_ref - 1.0, v_ref, ref_img)
-                iv_p, _ = _sample_ref(u_ref, v_ref + 1.0, ref_img)
-                iv_m, _ = _sample_ref(u_ref, v_ref - 1.0, ref_img)
-                gx = (iu_p - iu_m) * 0.5
-                gy = (iv_p - iv_m) * 0.5
-                grad_I_sq = gx * gx + gy * gy
-
+            grad_I_sq = gx * gx + gy * gy
             sigma_eff_sq = sigma_photo_sq + grad_I_sq * sigma_warp_sq
             inv_sigma_eff_sq = 1.0 / sigma_eff_sq
 
@@ -575,13 +644,13 @@ def _patch_residual_jacobian(
 def _solve_one_patch(
     cu, cv,
     seed_uv, seed_rho, seed_var,
-    curr_img, ref_img,
+    seed_grid_ids, seed_grid_starts, seed_grid_cols,
+    curr_img, ref_img, ref_grad_x, ref_grad_y,
     R, t,
     fx, fy, cx, cy,
     half,
     lambda_seed, seed_radius_px, sigma_seed_floor,
-    huber_delta, fd_eps,
-    n_search, search_half_range,
+    huber_delta,
     n_gn_iters,
     rho_min, rho_max,
     min_curvature, max_residual,
@@ -596,74 +665,56 @@ def _solve_one_patch(
     STATUS_PHOTO_REFINED = 2
     STATUS_REJECTED = 3
 
-    # Find nearby seeds
-    M = seed_uv.shape[0]
+    H_img = curr_img.shape[0]
+    n_total_cells = seed_grid_starts.shape[0] - 1
+    n_grid_rows = n_total_cells // seed_grid_cols
+
+    # Find nearby seeds via spatial grid
+    ci_min = max(0, int((cu - seed_radius_px) / seed_radius_px))
+    ci_max = min(seed_grid_cols - 1, int((cu + seed_radius_px) / seed_radius_px))
+    cj_min = max(0, int((cv - seed_radius_px) / seed_radius_px))
+    cj_max = min(n_grid_rows - 1, int((cv + seed_radius_px) / seed_radius_px))
+
     seed_rho_init = 0.0
     seed_weight_total = 0.0
     seed_precision_sum = 0.0
 
-    # Accumulate weighted seed rho and precision for cost term
+    MAX_NEARBY = 64
     n_seeds = 0
-    seed_indices = np.empty(M, dtype=numba.int64)
-    seed_weights = np.empty(M, dtype=numba.float64)
-    seed_precisions = np.empty(M, dtype=numba.float64)
+    local_indices = np.empty(MAX_NEARBY, dtype=numba.int64)
+    local_weights = np.empty(MAX_NEARBY, dtype=numba.float64)
+    local_precisions = np.empty(MAX_NEARBY, dtype=numba.float64)
 
-    for m in range(M):
-        du = seed_uv[m, 0] - cu
-        dv = seed_uv[m, 1] - cv
-        dist = (du * du + dv * dv) ** 0.5
-        if dist > seed_radius_px:
-            continue
-        w_spatial = 1.0 - dist / seed_radius_px
-        var_capped = max(seed_var[m], sigma_seed_floor * sigma_seed_floor)
-        prec = 1.0 / var_capped
+    for cj in range(cj_min, cj_max + 1):
+        for ci in range(ci_min, ci_max + 1):
+            cell_idx = cj * seed_grid_cols + ci
+            for k in range(seed_grid_starts[cell_idx], seed_grid_starts[cell_idx + 1]):
+                m = seed_grid_ids[k]
+                du = seed_uv[m, 0] - cu
+                dv = seed_uv[m, 1] - cv
+                dist = (du * du + dv * dv) ** 0.5
+                if dist > seed_radius_px:
+                    continue
+                if n_seeds >= MAX_NEARBY:
+                    break
+                w_spatial = 1.0 - dist / seed_radius_px
+                var_capped = max(seed_var[m], sigma_seed_floor * sigma_seed_floor)
+                prec = 1.0 / var_capped
 
-        seed_indices[n_seeds] = m
-        seed_weights[n_seeds] = w_spatial
-        seed_precisions[n_seeds] = prec
-        seed_rho_init += w_spatial * prec * seed_rho[m]
-        seed_weight_total += w_spatial * prec
-        seed_precision_sum += w_spatial * prec
-        n_seeds += 1
+                local_indices[n_seeds] = m
+                local_weights[n_seeds] = w_spatial
+                local_precisions[n_seeds] = prec
+                seed_rho_init += w_spatial * prec * seed_rho[m]
+                seed_weight_total += w_spatial * prec
+                seed_precision_sum += w_spatial * prec
+                n_seeds += 1
 
     if seed_weight_total > 0.0:
         rho_init = seed_rho_init / seed_weight_total
     else:
         return 0.0, 1e10, STATUS_UNKNOWN, 1e10, 0.0
 
-    rho_init = max(rho_min, min(rho_max, rho_init))
-
-    # Discrete search
-    best_rho = rho_init
-    best_cost = 1e30
-
-    for k in range(n_search):
-        frac = -search_half_range + 2.0 * search_half_range * k / max(n_search - 1, 1)
-        rho_k = rho_init * (1.0 + frac)
-        rho_k = max(rho_min, min(rho_max, rho_k))
-
-        photo_cost, nv = _patch_cost(
-            cu, cv, rho_k, half,
-            R, t, fx, fy, cx, cy,
-            curr_img, ref_img, huber_delta,
-        )
-        if nv == 0:
-            continue
-
-        # Seed cost
-        seed_cost = 0.0
-        for si in range(n_seeds):
-            m = seed_indices[si]
-            dr = rho_k - seed_rho[m]
-            seed_cost += lambda_seed * seed_weights[si] * seed_precisions[si] * dr * dr
-
-        total = photo_cost + seed_cost
-        if total < best_cost:
-            best_cost = total
-            best_rho = rho_k
-
-    # GN refinement
-    rho = best_rho
+    rho = max(rho_min, min(rho_max, rho_init))
     final_residual = 1e10
     final_curvature = 0.0
 
@@ -671,8 +722,8 @@ def _solve_one_patch(
         grad_photo, hess_photo, mean_res, nv = _patch_residual_jacobian(
             cu, cv, rho, half,
             R, t, fx, fy, cx, cy,
-            curr_img, ref_img,
-            huber_delta, fd_eps,
+            curr_img, ref_img, ref_grad_x, ref_grad_y,
+            huber_delta,
             sigma_photo_sq, sigma_warp_sq,
         )
         if nv == 0:
@@ -682,9 +733,9 @@ def _solve_one_patch(
         grad_seed = 0.0
         hess_seed = 0.0
         for si in range(n_seeds):
-            m = seed_indices[si]
+            m = local_indices[si]
             dr = rho - seed_rho[m]
-            wp = lambda_seed * seed_weights[si] * seed_precisions[si]
+            wp = lambda_seed * local_weights[si] * local_precisions[si]
             grad_seed += wp * dr
             hess_seed += wp
 
@@ -763,13 +814,13 @@ def _solve_all_patches(
     patch_centers, patch_rho, patch_var, patch_status,
     patch_residual, patch_curvature,
     seed_uv, seed_rho, seed_var,
-    curr_img, ref_img,
+    seed_grid_ids, seed_grid_starts, seed_grid_cols,
+    curr_img, ref_img, ref_grad_x, ref_grad_y,
     R, t,
     fx, fy, cx, cy,
     patch_size, lambda_seed, seed_radius_px,
     sigma_seed_floor,
-    huber_delta, fd_eps,
-    n_search, search_half_range,
+    huber_delta,
     n_gn_iters,
     rho_min, rho_max,
     min_curvature, max_residual,
@@ -784,13 +835,13 @@ def _solve_all_patches(
         rho, var, status, res, curv = _solve_one_patch(
             cu, cv,
             seed_uv, seed_rho, seed_var,
-            curr_img, ref_img,
+            seed_grid_ids, seed_grid_starts, seed_grid_cols,
+            curr_img, ref_img, ref_grad_x, ref_grad_y,
             R, t,
             fx, fy, cx, cy,
             half,
             lambda_seed, seed_radius_px, sigma_seed_floor,
-            huber_delta, fd_eps,
-            n_search, search_half_range,
+            huber_delta,
             n_gn_iters,
             rho_min, rho_max,
             min_curvature, max_residual,
