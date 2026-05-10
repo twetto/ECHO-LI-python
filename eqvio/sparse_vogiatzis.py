@@ -92,7 +92,7 @@ class SparseVogSettings:
     conv_variance_threshold: float = 0.5  # var(z) threshold for query()
 
     # --- Initial state (Euclidean depth) ---
-    init_depth_var: float = 1.0
+    init_depth_var: float = 0.01
     sigma_pixel: float = 0.5
     dist_coeffs: Optional[np.ndarray] = None  # if provided, features are undistorted
 
@@ -325,6 +325,12 @@ class SparseVogiatzisFilter:
                 init_obs, init_var = self._rho_to_canonical(
                     rho_obs, tau_rho + tau_pixel,
                 )
+                # Floor init variance with prior so a single outlier
+                # triangulation can't lock the filter.
+                _, init_var_prior = self._canonical_from_depth(
+                    z_obs, self.settings.init_depth_var,
+                )
+                init_var = max(init_var, init_var_prior)
                 init_cov_ce = tau_pixel
                 init_var_eta = tau_pixel
                 if flowdep is not None:
@@ -390,6 +396,10 @@ class SparseVogiatzisFilter:
                 c_init, v_init = self._rho_to_canonical(
                     rho_obs, tau_rho + tau_pixel,
                 )
+                _, v_prior = self._canonical_from_depth(
+                    z_obs, self.settings.init_depth_var,
+                )
+                v_init = max(v_init, v_prior)
                 feat.canonical = c_init
                 feat.canonical_var = v_init
                 H_init = self._rho_jacobian(c_init)
@@ -755,6 +765,15 @@ class SparseVogiatzisFilter:
         var_eta = feat.var_eta
         a = feat.a
         b = feat.b
+
+        # Rescale cross-covariance from stored drive to current drive.
+        # The reference pixel noise scales as sigma_norm/drive, so when the
+        # drive changes between re-anchor and the current observation,
+        # var_eta and cov_ce need adjustment.
+        if var_eta > 1e-30 and tau_pixel > 1e-30:
+            ratio = math.sqrt(tau_pixel / var_eta)
+            cov_ce *= ratio
+            var_eta = tau_pixel
 
         # IEKF: iterate linearization point (eta is linear, only h(canonical) is nonlinear).
         m_iter = mu
@@ -1350,13 +1369,49 @@ class SparseVogiatzisFilter3D(SparseVogiatzisFilter):
 
         K_bearing = feat.covariance @ H_bearing.T @ S_inv
         inn_bearing = y_observed - y_pred
-        Delta_eps_bearing = K_bearing @ inn_bearing
+
+        maha_sq = float(inn_bearing @ S_inv @ inn_bearing)
+
+        # Gaussian-Beta mixture for bearing update.
+        a, b = feat.a, feat.b
+        ab = a + b
+
+        if maha_sq < -100.0:
+            gauss_pdf = 0.0
+        else:
+            det_S = float(np.linalg.det(S_bearing))
+            if det_S < 1e-30:
+                return
+            gauss_pdf = math.exp(-0.5 * maha_sq) / math.sqrt(
+                (2.0 * math.pi) ** 2 * det_S
+            )
+
+        # Uniform over image (approximate)
+        U_prior = 1.0 / (float(self.K[0, 0]) * float(self.K[1, 1]) * 4.0)
+        C1 = (a / ab) * gauss_pdf
+        C2 = (b / ab) * U_prior
+        Z_norm = C1 + C2
+
+        if Z_norm < 1e-30:
+            feat.b = min(b + 1.0, s.ab_max)
+            return
+
+        w1 = C1 / Z_norm
+        w2 = C2 / Z_norm
+
+        Delta_eps_bearing = (w1) * K_bearing @ inn_bearing
 
         lm_new = point_chart_normal_inv(Delta_eps_bearing,
                                         Landmark(p=q, id=feat.feat_id))
 
         I_KH = np.eye(3) - K_bearing @ H_bearing
-        P_new = I_KH @ feat.covariance @ I_KH.T + K_bearing @ R_bearing @ K_bearing.T
+        P_kalman = I_KH @ feat.covariance @ I_KH.T + K_bearing @ R_bearing @ K_bearing.T
+        full_eps = K_bearing @ inn_bearing
+        P_new = (
+            w1 * P_kalman
+            + w2 * feat.covariance
+            + w1 * w2 * np.outer(full_eps, full_eps)
+        )
 
         eigvals = np.linalg.eigvalsh(P_new)
         if np.any(eigvals <= 0):

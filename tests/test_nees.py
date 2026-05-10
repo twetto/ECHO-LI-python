@@ -37,11 +37,11 @@ from eqvio.mathematical.vio_state import Landmark
 Z_TRUE = 100.0
 FX = FY = 458.0
 CX, CY = 376.0, 240.0
-# SIGMA_PIXEL = 0.1
-SIGMA_PIXEL = 0.5
+SIGMA_PIXEL = 0.1
+# SIGMA_PIXEL = 0.5
 BASELINE_PER_FRAME = 0.05
 DT = 0.05
-N_STEPS = 100
+N_STEPS = 1500
 U_TRUE, V_TRUE = 400.0, 250.0
 
 K_MAT = np.array([[FX, 0, CX], [0, FY, CY], [0, 0, 1]])
@@ -103,7 +103,7 @@ def _true_canonical_1d(param, z_true):
 # Single-trial runners returning per-step NEES
 # ================================================================
 
-def _run_1d_nees(param, is_vog, data, z_true):
+def _run_1d_nees(param, is_vog, data, z_true, init_depth_var=1.0):
     s = SparseVogSettings(
         parametrization=param,
         a_init=10.0 if is_vog else 1e8,
@@ -113,11 +113,13 @@ def _run_1d_nees(param, is_vog, data, z_true):
         min_track_length=1,
         sigma_pixel=SIGMA_PIXEL,
         process_depth_var=0.0,
+        init_depth_var=init_depth_var,
     )
     filt = SparseVogiatzisFilter(K_MAT, s)
 
     n = len(data) - 1
     nees = np.full(n, np.nan)
+    rel_err = np.full(n, np.nan)
 
     for i in range(n + 1):
         T_WC, uv, P_C, _ = data[i]
@@ -131,11 +133,14 @@ def _run_1d_nees(param, is_vog, data, z_true):
                 c_true = _true_canonical_1d(param, z_curr)
                 err = feat.canonical - c_true
                 nees[i - 1] = (err * err) / feat.canonical_var
+                z_est, _ = filt.query(42)
+                if z_est > 0 and z_curr > 0:
+                    rel_err[i - 1] = abs(z_est - z_curr) / z_curr
 
-    return nees
+    return nees, rel_err
 
 
-def _run_3d_nees(is_vog, data, z_true):
+def _run_3d_nees(is_vog, data, z_true, init_depth_var=1.0):
     s = SparseVogSettings(
         a_init=10.0 if is_vog else 1e8,
         b_init=2.0 if is_vog else 1e-8,
@@ -144,11 +149,13 @@ def _run_3d_nees(is_vog, data, z_true):
         min_track_length=1,
         sigma_pixel=SIGMA_PIXEL,
         process_depth_var=0.0,
+        init_depth_var=init_depth_var,
     )
     filt = SparseVogiatzisFilter3D(K_MAT, s)
 
     n = len(data) - 1
     nees = np.full(n, np.nan)
+    rel_err = np.full(n, np.nan)
 
     for i in range(n + 1):
         T_WC, uv, P_C, _ = data[i]
@@ -169,8 +176,12 @@ def _run_3d_nees(is_vog, data, z_true):
                     nees[i - 1] = float(eps @ P_inv @ eps)
                 except np.linalg.LinAlgError:
                     pass
+                d_true = float(np.linalg.norm(P_C))
+                d_est = feat.depth
+                if d_est > 0 and d_true > 0:
+                    rel_err[i - 1] = abs(d_est - d_true) / d_true
 
-    return nees
+    return nees, rel_err
 
 
 # ================================================================
@@ -178,16 +189,17 @@ def _run_3d_nees(is_vog, data, z_true):
 # ================================================================
 
 def _run_mc(param_enum, param_name, is_vog, n_mc, n_steps, z_true,
-            outlier_rate, base_seed):
+            outlier_rate, base_seed, init_depth_var=1.0):
     all_nees = np.full((n_mc, n_steps), np.nan)
+    all_rel_err = np.full((n_mc, n_steps), np.nan)
     for mc in range(n_mc):
         rng = np.random.default_rng(base_seed + mc)
         data = _gen_data(rng, n_steps, z_true, outlier_rate)
         if param_name == "polar3d":
-            all_nees[mc] = _run_3d_nees(is_vog, data, z_true)
+            all_nees[mc], all_rel_err[mc] = _run_3d_nees(is_vog, data, z_true, init_depth_var)
         else:
-            all_nees[mc] = _run_1d_nees(param_enum, is_vog, data, z_true)
-    return all_nees
+            all_nees[mc], all_rel_err[mc] = _run_1d_nees(param_enum, is_vog, data, z_true, init_depth_var)
+    return all_nees, all_rel_err
 
 
 # ================================================================
@@ -202,6 +214,7 @@ def main():
     ap.add_argument("--n-mc", type=int, default=50)
     ap.add_argument("--seed", type=int, default=1000)
     ap.add_argument("--z-true", type=float, default=Z_TRUE)
+    ap.add_argument("--init-depth-var", type=float, default=SparseVogSettings.init_depth_var)
     ap.add_argument("--save", type=str, default="nees_consistency.png")
     args = ap.parse_args()
 
@@ -226,51 +239,86 @@ def main():
         "polar3d": "tab:red",
     }
 
-    fig, axes = plt.subplots(2, 2, figsize=(14, 9), sharex=True)
-    axes = axes.flatten()
+    from scipy.stats import chi2
+
+    fig, axes = plt.subplots(3, 4, figsize=(18, 12), sharex=True)
+    mean_axes = axes[0]
+    median_axes = axes[1]
+    err_axes = axes[2]
     steps = np.arange(n)
 
     for idx, (p_enum, p_name) in enumerate(configs):
-        ax = axes[idx]
+        ax_mean = mean_axes[idx]
+        ax_med = median_axes[idx]
+        ax_e = err_axes[idx]
         dim = 3 if p_name == "polar3d" else 1
 
         for is_vog, label, ls, lw in [
             (True, "Gaussian-Beta", "-", 1.5),
             (False, "Gaussian", "--", 1.0),
         ]:
-            all_nees = _run_mc(p_enum, p_name, is_vog, n_mc, n,
-                               z_true, outlier_rate, args.seed)
+            all_nees, all_rel_err = _run_mc(p_enum, p_name, is_vog, n_mc, n,
+                                            z_true, outlier_rate, args.seed,
+                                            args.init_depth_var)
 
-            valid_count = np.sum(np.isfinite(all_nees), axis=0)
             mean_nees = np.nanmean(all_nees, axis=0)
+            median_nees = np.nanmedian(all_nees, axis=0)
+            median_rel_err = np.nanmedian(all_rel_err, axis=0)
 
-            ax.plot(steps, mean_nees,
-                    color=colors[p_name], ls=ls, lw=lw,
-                    alpha=0.85, label=f"{label} (mean)")
+            ax_mean.plot(steps, mean_nees,
+                         color=colors[p_name], ls=ls, lw=lw,
+                         alpha=0.85, label=f"{label}")
+            ax_med.plot(steps, median_nees,
+                        color=colors[p_name], ls=ls, lw=lw,
+                        alpha=0.85, label=f"{label}")
+            ax_e.plot(steps, median_rel_err * 100.0,
+                      color=colors[p_name], ls=ls, lw=lw,
+                      alpha=0.85, label=f"{label}")
 
-            # Print summary
-            settled = mean_nees[n // 2:]
-            avg = np.nanmean(settled)
+            settled_mean = mean_nees[n // 2:]
+            settled_med = median_nees[n // 2:]
+            settled_err = median_rel_err[n // 2:]
             print(f"  {p_name:10s} / {label:14s}: "
-                  f"avg NEES (2nd half) = {avg:.3f}  "
-                  f"(expected {dim})")
+                  f"mean NEES = {np.nanmean(settled_mean):.3f}  "
+                  f"median NEES = {np.nanmedian(settled_med):.3f}  "
+                  f"(expected {dim})  "
+                  f"median rel_err = {np.nanmedian(settled_err):.4f}")
 
-        # Chi-squared 95% bounds for the mean of n_mc independent χ²(dim)
-        # Mean of n_mc χ²(dim) ~ Normal(dim, 2*dim/n_mc) for large n_mc
-        from scipy.stats import chi2
-        lo = chi2.ppf(0.025, dim * n_mc) / n_mc
-        hi = chi2.ppf(0.975, dim * n_mc) / n_mc
-        ax.axhline(dim, color="k", ls=":", lw=0.8, label=f"E[NEES]={dim}")
-        ax.axhspan(lo, hi, color="gray", alpha=0.12, label="95% bounds")
+        # Mean NEES: E[NEES]=dim, 95% CI for mean of n_mc chi²(dim)
+        lo_mean = chi2.ppf(0.025, dim * n_mc) / n_mc
+        hi_mean = chi2.ppf(0.975, dim * n_mc) / n_mc
+        ax_mean.axhline(dim, color="k", ls=":", lw=0.8, label=f"E[NEES]={dim}")
+        ax_mean.axhspan(lo_mean, hi_mean, color="gray", alpha=0.12, label="95% bounds")
 
-        ax.set_title(f"{p_name}  (dim={dim})", fontsize=11)
-        ax.set_ylabel("Mean NEES")
-        ax.legend(fontsize=7, loc="upper right")
-        ax.grid(True, alpha=0.3)
-        ax.set_ylim(bottom=0)
+        # Median NEES: median(chi²(dim)), 95% CI via bootstrap
+        expected_median = float(chi2.median(dim))
+        rng_ci = np.random.default_rng(0)
+        boot_medians = np.array([
+            np.median(rng_ci.chisquare(dim, size=n_mc))
+            for _ in range(10000)
+        ])
+        lo_med = np.percentile(boot_medians, 2.5)
+        hi_med = np.percentile(boot_medians, 97.5)
+        ax_med.axhline(expected_median, color="k", ls=":", lw=0.8,
+                       label=f"med[χ²({dim})]={expected_median:.2f}")
+        ax_med.axhspan(lo_med, hi_med, color="gray", alpha=0.12, label="95% bounds")
 
-    for ax in axes[2:]:
-        ax.set_xlabel("Observation step")
+        ax_mean.set_title(f"{p_name}  (dim={dim})", fontsize=11)
+        ax_mean.set_ylabel("Mean NEES")
+        ax_mean.legend(fontsize=7, loc="upper right")
+        ax_mean.grid(True, alpha=0.3)
+        ax_mean.set_ylim(bottom=0)
+
+        ax_med.set_ylabel("Median NEES")
+        ax_med.legend(fontsize=7, loc="upper right")
+        ax_med.grid(True, alpha=0.3)
+        ax_med.set_ylim(bottom=0)
+
+        ax_e.set_ylabel("Rel. depth error (%)")
+        ax_e.legend(fontsize=7, loc="upper right")
+        ax_e.grid(True, alpha=0.3)
+        ax_e.set_ylim(bottom=0)
+        ax_e.set_xlabel("Observation step")
 
     fig.suptitle(
         f"NEES consistency  |  z*={z_true}m, σ_px={SIGMA_PIXEL}, "
