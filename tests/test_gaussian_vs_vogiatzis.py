@@ -35,6 +35,7 @@ import matplotlib.pyplot as plt
 from eqvio.sparse_vogiatzis import (
     SparseVogiatzisFilter,
     SparseVogiatzisFilter3D,
+    SparseVogiatzisFilterInvDepth3D,
     SparseVogSettings,
     DepthParametrization
 )
@@ -161,7 +162,7 @@ def _run_1d(param: DepthParametrization, is_vogiatzis: bool, data,
     return err, var_, ir
 
 
-def _run_3d(is_vogiatzis: bool, data, P_vv=None, ab_max=20.0,
+def _run_3d(filter_cls, is_vogiatzis: bool, data, P_vv=None, ab_max=20.0,
             min_inlier_ratio=0.5):
     s = SparseVogSettings(
         a_init=10.0 if is_vogiatzis else 1e8,
@@ -172,7 +173,7 @@ def _run_3d(is_vogiatzis: bool, data, P_vv=None, ab_max=20.0,
         sigma_pixel=SIGMA_PIXEL,
         process_depth_var=0.0,
     )
-    filt = SparseVogiatzisFilter3D(K_MAT, s)
+    filt = filter_cls(K_MAT, s)
 
     n = len(data) - 1
     err, var_, ir = np.empty(n), np.empty(n), np.empty(n)
@@ -262,6 +263,7 @@ def main():
         "invdepth":  "tab:orange",
         "polar":     "tab:green",
         "polar3d":   "tab:red",
+        "invdepth3d": "tab:purple",
     }
 
     # ---- Panel A: baseline (no P_vv) ----
@@ -274,7 +276,9 @@ def main():
     for vog in [True, False]:
         label = "Gaussian-Beta" if vog else "Gaussian"
         key = f"polar3d / {label}"
-        results_base[key] = _run_3d(vog, data)
+        results_base[key] = _run_3d(SparseVogiatzisFilter3D, vog, data)
+        key = f"invdepth3d / {label}"
+        results_base[key] = _run_3d(SparseVogiatzisFilterInvDepth3D, vog, data)
 
     # ---- Panel B: with P_vv (3\u00d73) \u2014 baseline \u03c4\u00b2 inflation ----
     results_pvv: dict[str, tuple[np.ndarray, np.ndarray, np.ndarray]] = {}
@@ -286,7 +290,11 @@ def main():
     for vog in [True, False]:
         label = "Gaussian-Beta" if vog else "Gaussian"
         key = f"polar3d / {label}"
-        results_pvv[key] = _run_3d(vog, data, P_vv=P_vv_3x3)
+        results_pvv[key] = _run_3d(SparseVogiatzisFilter3D, vog, data, P_vv=P_vv_3x3)
+        key = f"invdepth3d / {label}"
+        results_pvv[key] = _run_3d(
+            SparseVogiatzisFilterInvDepth3D, vog, data, P_vv=P_vv_3x3,
+        )
 
     # ---- Panel C: with P_UU (6\u00d76) \u2014 baseline \u03c4\u00b2 + rotational Q ----
     results_puu: dict[str, tuple[np.ndarray, np.ndarray, np.ndarray]] = {}
@@ -298,7 +306,11 @@ def main():
     for vog in [True, False]:
         label = "Gaussian-Beta" if vog else "Gaussian"
         key = f"polar3d / {label}"
-        results_puu[key] = _run_3d(vog, data, P_vv=P_UU_6x6)
+        results_puu[key] = _run_3d(SparseVogiatzisFilter3D, vog, data, P_vv=P_UU_6x6)
+        key = f"invdepth3d / {label}"
+        results_puu[key] = _run_3d(
+            SparseVogiatzisFilterInvDepth3D, vog, data, P_vv=P_UU_6x6,
+        )
 
     # ---- Print final state ----
     for tag, results in [("No P_vv", results_base),

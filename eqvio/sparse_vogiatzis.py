@@ -50,6 +50,11 @@ from .coordinate_suite.normal import (
     point_chart_normal_inv,
     sphere_chart_normal_inv_diff0,
 )
+from .coordinate_suite.invdepth import (
+    conv_euc2ind,
+    conv_ind2euc,
+    point_chart_invdepth_inv,
+)
 
 
 # ============================================================================
@@ -118,7 +123,7 @@ class SparseVogSettings:
     min_parallax: float = 1e-4   # ideal parallax mag (normalised image coords)
     min_cos_sim: float = 0.95    # reject pixel motion misaligned with epipolar
     min_depth: float = 0.1
-    max_depth: float = 100.0
+    max_depth: float = 150.0
     reanchor_flow_px: float = 3.0  # derotated flow (px) before update+re-anchor
 
 
@@ -1046,6 +1051,28 @@ class FeatureState3D:
         return self.a / ab
 
 
+@dataclass
+class FeatureStateInvDepth3D(FeatureState3D):
+    """3D landmark state whose covariance radial slot is inverse depth.
+
+    Indices 0,1 are the stereographic bearing coordinates from
+    coordinate_suite.invdepth.  The stored radial coordinate is inverse
+    distance, so initialization must use a relative-depth prior scale
+    rather than a raw inverse-depth variance.
+    """
+
+    @property
+    def depth(self) -> float:
+        return float(self.position[2])
+
+    @property
+    def depth_var(self) -> float:
+        if self.depth < 1e-6:
+            return float("inf")
+        H_z = np.array([[0.0, 0.0, 1.0]]) @ conv_ind2euc(self.position)
+        return float((H_z @ self.covariance @ H_z.T).item())
+
+
 class SparseVogiatzisFilter3D(SparseVogiatzisFilter):
     """3D local IEKF on SOT(3) manifold with Normal chart.
 
@@ -1065,6 +1092,42 @@ class SparseVogiatzisFilter3D(SparseVogiatzisFilter):
         self._eqf_suite = eqf_suite
         self._cam_ptr = cam_ptr
         self._last_T_WC: Optional[np.ndarray] = None
+
+    def _make_feature_3d(
+        self,
+        feat_id: int,
+        position: np.ndarray,
+        covariance: np.ndarray,
+        ref_T_WC: np.ndarray,
+        ref_uv: np.ndarray,
+        ref_stamp: float,
+    ) -> FeatureState3D:
+        return FeatureState3D(
+            feat_id=feat_id,
+            position=position,
+            covariance=covariance,
+            a=self.settings.a_init,
+            b=self.settings.b_init,
+            ref_T_WC=ref_T_WC,
+            ref_uv=ref_uv,
+            ref_stamp=ref_stamp,
+        )
+
+    def _chart_to_euc_jac_3d(self, q: np.ndarray) -> np.ndarray:
+        return conv_normal2euc(q)
+
+    def _euc_to_chart_jac_3d(self, q: np.ndarray) -> np.ndarray:
+        return conv_euc2normal(q)
+
+    def _apply_chart_delta_3d(
+        self,
+        feat: FeatureState3D,
+        delta: np.ndarray,
+    ) -> Landmark:
+        return point_chart_normal_inv(
+            delta,
+            Landmark(p=feat.position, id=feat.feat_id),
+        )
 
     def update(
         self,
@@ -1160,20 +1223,17 @@ class SparseVogiatzisFilter3D(SparseVogiatzisFilter):
                 init_pos = self._position_from_depth(
                     uv_curr, z_obs, self.settings.init_depth_var
                 )
-                feat = FeatureState3D(
-                    feat_id=fid,
-                    position=init_pos,
-                    covariance=self._init_cov_3d(z_obs, drive, feat_btau),
-                    a=self.settings.a_init,
-                    b=self.settings.b_init,
-                    ref_T_WC=T_WC.copy(),
-                    ref_uv=uv_curr.copy(),
-                    ref_stamp=stamp,
+                feat = self._make_feature_3d(
+                    fid,
+                    init_pos,
+                    self._init_cov_3d(init_pos, z_obs, drive, feat_btau),
+                    T_WC.copy(),
+                    uv_curr.copy(),
+                    stamp,
                 )
                 self._features3d[fid] = feat
                 del self._pending[fid]
                 self._bearing_update_3d(feat, uv_curr)
-                self._depth_update_3d(feat, uv_curr, z_obs, drive, feat_btau)
                 feat.track_length += 1
                 continue
 
@@ -1185,8 +1245,11 @@ class SparseVogiatzisFilter3D(SparseVogiatzisFilter):
             # Per-frame bearing update (pixel obs is independent each frame).
             if feat.depth > 0:
                 self._bearing_update_3d(feat, uv_curr)
+                feat.track_length += 1
+                continue
 
-            # Triangulate from reference for depth update.
+            # Prediction invalidated; reinitialize from the original
+            # reference only when triangulation is valid.
             T_curr_ref = T_CW_curr @ feat.ref_T_WC
             R_ref = T_curr_ref[:3, :3]
             t_ref = T_curr_ref[:3, 3]
@@ -1197,8 +1260,6 @@ class SparseVogiatzisFilter3D(SparseVogiatzisFilter):
             if z_obs <= 0.0:
                 feat.track_length += 1
                 continue
-
-            flow_px = drive * float(self.K[0, 0])
 
             t_ref_nsq = float(t_ref[0] ** 2 + t_ref[1] ** 2 + t_ref[2] ** 2)
             feat_btau = 0.0
@@ -1216,20 +1277,15 @@ class SparseVogiatzisFilter3D(SparseVogiatzisFilter):
                     uv_curr, z_obs, self.settings.init_depth_var
                 )
                 feat.position = init_pos
-                feat.covariance = self._init_cov_3d(z_obs, drive, feat_btau)
+                feat.covariance = self._init_cov_3d(
+                    init_pos, z_obs, drive, feat_btau,
+                )
                 feat.a = self.settings.a_init
                 feat.b = self.settings.b_init
                 feat.ref_T_WC = T_WC.copy()
                 feat.ref_uv = uv_curr.copy()
                 feat.ref_stamp = stamp
                 self._bearing_update_3d(feat, uv_curr)
-                self._depth_update_3d(feat, uv_curr, z_obs, drive, feat_btau)
-            elif flow_px >= self.settings.reanchor_flow_px:
-                # Flow-gated depth update + re-anchor.
-                self._depth_update_3d(feat, uv_curr, z_obs, drive, feat_btau)
-                feat.ref_T_WC = T_WC.copy()
-                feat.ref_uv = uv_curr.copy()
-                feat.ref_stamp = stamp
 
             feat.track_length += 1
 
@@ -1257,17 +1313,55 @@ class SparseVogiatzisFilter3D(SparseVogiatzisFilter):
         y_norm = (uv[1] - cy) / fy
         return np.array([x_norm * depth, y_norm * depth, depth])
 
-    def _init_cov_3d(self, z_obs: float, drive: float,
-                     baseline_tau_sq: float) -> np.ndarray:
-        """Initial Normal-chart covariance.
+    def _init_cov_3d(
+        self,
+        position: np.ndarray,
+        z_obs: float,
+        drive: float,
+        baseline_tau_sq: float,
+    ) -> np.ndarray:
+        """Initial chart covariance from a shared Euclidean uncertainty.
 
-        Uses init_depth_var for all directions.  A wide isotropic prior
-        is necessary because the coupled bearing update aggressively
-        shrinks depth via cross-covariance — a tight depth init gets
-        crushed to ~1e-6 after a single update, causing overconfidence.
+        The 3D variants should differ by chart only, not by hidden prior
+        semantics.  We first build an approximate Euclidean covariance for
+        the triangulated initialization, then map it through the active
+        chart Jacobian.  This keeps polar3d and invdepth3d plots comparable.
         """
-        v0 = self.settings.init_depth_var
-        return np.eye(3) * v0
+        z = max(float(z_obs), self.settings.min_depth)
+        q = position.astype(np.float64)
+        x_over_z = q[0] / z
+        y_over_z = q[1] / z
+
+        # Pixel noise gives bearing uncertainty in normalized coordinates.
+        J_bearing = np.array([
+            [z, 0.0],
+            [0.0, z],
+            [0.0, 0.0],
+        ])
+        P_euc = self._sigma_norm_sq * (J_bearing @ J_bearing.T)
+
+        # Derotated triangulation observes inverse depth with variance
+        # sigma_norm^2 / drive^2.  Map that to camera-z variance and then to
+        # the Euclidean point along the current bearing ray.
+        if drive > 1e-12:
+            var_z = (
+                (z ** 4) * self._sigma_norm_sq / (drive * drive)
+                + (z * z) * baseline_tau_sq
+            )
+        else:
+            var_z = self.settings.init_depth_var * z * z
+        J_depth = np.array([x_over_z, y_over_z, 1.0])
+        P_euc += var_z * np.outer(J_depth, J_depth)
+
+        M_euc2chart = self._euc_to_chart_jac_3d(q)
+        cov = M_euc2chart @ P_euc @ M_euc2chart.T
+        cov = 0.5 * (cov + cov.T)
+
+        eigvals = np.linalg.eigvalsh(cov)
+        min_eig = float(np.min(eigvals))
+        if min_eig < self.settings.min_canonical_var:
+            cov += np.eye(3) * (self.settings.min_canonical_var - min_eig)
+        return cov
 
     def _predict_feature_3d(
         self,
@@ -1289,8 +1383,8 @@ class SparseVogiatzisFilter3D(SparseVogiatzisFilter):
             feat.position = np.zeros(3)
             return
 
-        M_norm2euc = conv_normal2euc(q_old)
-        M_euc2norm = conv_euc2normal(q_new)
+        M_norm2euc = self._chart_to_euc_jac_3d(q_old)
+        M_euc2norm = self._euc_to_chart_jac_3d(q_new)
 
         J = M_euc2norm @ R @ M_norm2euc
         cov_new = J @ feat.covariance @ J.T
@@ -1350,7 +1444,7 @@ class SparseVogiatzisFilter3D(SparseVogiatzisFilter):
             H_euc[1, 1] = fy / z
             H_euc[1, 2] = -fy * y / (z * z)
 
-        M_norm2euc = conv_normal2euc(q)
+        M_norm2euc = self._chart_to_euc_jac_3d(q)
         H_bearing = H_euc @ M_norm2euc
 
         y_pred = np.array([
@@ -1401,8 +1495,7 @@ class SparseVogiatzisFilter3D(SparseVogiatzisFilter):
 
         Delta_eps_bearing = (w1) * K_bearing @ inn_bearing
 
-        lm_new = point_chart_normal_inv(Delta_eps_bearing,
-                                        Landmark(p=q, id=feat.feat_id))
+        lm_new = self._apply_chart_delta_3d(feat, Delta_eps_bearing)
 
         I_KH = np.eye(3) - K_bearing @ H_bearing
         P_kalman = I_KH @ feat.covariance @ I_KH.T + K_bearing @ R_bearing @ K_bearing.T
@@ -1469,7 +1562,9 @@ class SparseVogiatzisFilter3D(SparseVogiatzisFilter):
             feat.position = self._position_from_depth(
                 y_observed, z_obs, s.init_depth_var,
             )
-            feat.covariance = np.eye(3) * s.init_depth_var
+            feat.covariance = self._init_cov_3d(
+                feat.position, z_obs, drive, baseline_tau_sq,
+            )
             feat.a = s.a_init
             feat.b = s.b_init
             return
@@ -1497,8 +1592,7 @@ class SparseVogiatzisFilter3D(SparseVogiatzisFilter):
 
         Delta_eps_depth = (w1 * inn_depth) * K_dep
 
-        lm_new = point_chart_normal_inv(Delta_eps_depth,
-                                        Landmark(p=q, id=feat.feat_id))
+        lm_new = self._apply_chart_delta_3d(feat, Delta_eps_depth)
 
         H_dep = np.array([[0.0, 0.0, -1.0]])
         KH_dep = np.outer(K_dep, H_dep)
@@ -1590,3 +1684,175 @@ class SparseVogiatzisFilter3D(SparseVogiatzisFilter):
             positions[fid] = R_CtoG @ feat.position + p_CinG
 
         return positions
+
+
+class SparseVogiatzisFilterInvDepth3D(SparseVogiatzisFilter3D):
+    """3D sparse GB filter with a camera-Z inverse-depth observation.
+
+    This keeps the coupled 3D bearing/radial covariance from polar3d, but uses
+    the repository's inverse-depth landmark chart: stereographic bearing plus
+    rho = 1 / ||q||.  Triangulation observations remain in sparse-GB
+    convention, i.e. rho_z = 1 / z_camera, and are linearized through the
+    3D chart.
+    """
+
+    def _make_feature_3d(
+        self,
+        feat_id: int,
+        position: np.ndarray,
+        covariance: np.ndarray,
+        ref_T_WC: np.ndarray,
+        ref_uv: np.ndarray,
+        ref_stamp: float,
+    ) -> FeatureStateInvDepth3D:
+        return FeatureStateInvDepth3D(
+            feat_id=feat_id,
+            position=position,
+            covariance=covariance,
+            a=self.settings.a_init,
+            b=self.settings.b_init,
+            ref_T_WC=ref_T_WC,
+            ref_uv=ref_uv,
+            ref_stamp=ref_stamp,
+        )
+
+    def _chart_to_euc_jac_3d(self, q: np.ndarray) -> np.ndarray:
+        return conv_ind2euc(q)
+
+    def _euc_to_chart_jac_3d(self, q: np.ndarray) -> np.ndarray:
+        return conv_euc2ind(q)
+
+    def _apply_chart_delta_3d(
+        self,
+        feat: FeatureState3D,
+        delta: np.ndarray,
+    ) -> Landmark:
+        rho0 = 1.0 / np.linalg.norm(feat.position)
+        if rho0 + delta[2] <= 1e-6:
+            delta = delta.copy()
+            delta[2] = 1e-6 - rho0
+        return point_chart_invdepth_inv(
+            delta,
+            Landmark(p=feat.position, id=feat.feat_id),
+        )
+
+    def _depth_update_3d(
+            self,
+            feat: FeatureState3D,
+            y_observed: np.ndarray,
+            z_obs: float,
+            drive: float,
+            baseline_tau_sq: float = 0.0,
+        ) -> None:
+        """Flow-gated camera-Z inverse-depth update with GB mixture."""
+        s = self.settings
+        q = feat.position
+        z_cur = float(np.linalg.norm(q))
+        if z_cur < s.min_depth:
+            return
+
+        if q[2] < s.min_depth:
+            return
+
+        rho_obs = 1.0 / z_obs
+        rho_pred = 1.0 / q[2]
+        if rho_obs <= 0.0 or not math.isfinite(rho_obs):
+            return
+
+        inn_depth = rho_obs - rho_pred
+        tau_rho_sq = (
+            self._sigma_norm_sq / (drive * drive)
+            + rho_obs * rho_obs * baseline_tau_sq
+        )
+        H_euc = np.array([[0.0, 0.0, -1.0 / (q[2] * q[2])]])
+        H_dep = H_euc @ self._chart_to_euc_jac_3d(q)
+        S_dep = float((H_dep @ feat.covariance @ H_dep.T).item()) + tau_rho_sq
+        if S_dep < 1e-30:
+            return
+
+        maha_sq_dep = (inn_depth * inn_depth) / S_dep
+        a, b = feat.a, feat.b
+        ab = a + b
+
+        if (
+            s.mahalanobis_reset_chi2 > 0.0
+            and ab > 0.0
+            and (a / ab) < s.min_inlier_ratio
+            and maha_sq_dep > s.mahalanobis_reset_chi2
+        ):
+            feat.position = self._position_from_depth(
+                y_observed, z_obs, s.init_depth_var,
+            )
+            feat.covariance = self._init_cov_3d(
+                feat.position, z_obs, drive, baseline_tau_sq,
+            )
+            feat.a = s.a_init
+            feat.b = s.b_init
+            return
+
+        exponent = -0.5 * maha_sq_dep
+        if exponent < -50.0:
+            gauss_pdf = 0.0
+        else:
+            gauss_pdf = math.exp(exponent) / math.sqrt(
+                2.0 * math.pi * S_dep
+            )
+
+        U_prior = 1.0 / max(s.uniform_rho_max, 1e-12)
+        C1 = (a / ab) * gauss_pdf
+        C2 = (b / ab) * U_prior
+        Z_norm = C1 + C2
+
+        if Z_norm < 1e-30:
+            feat.b = min(b + 1.0, s.ab_max)
+            return
+
+        w1 = C1 / Z_norm
+        w2 = C2 / Z_norm
+
+        K_dep = (feat.covariance @ H_dep.T).reshape(3) / S_dep
+        Delta_eps_depth = (w1 * inn_depth) * K_dep
+        lm_new = self._apply_chart_delta_3d(feat, Delta_eps_depth)
+
+        KH_dep = np.outer(K_dep, H_dep.reshape(3))
+        I_KH_dep = np.eye(3) - KH_dep
+        P_kalman = (
+            I_KH_dep @ feat.covariance @ I_KH_dep.T
+            + tau_rho_sq * np.outer(K_dep, K_dep)
+        )
+
+        full_dep_eps = inn_depth * K_dep
+        P_new = (
+            w1 * P_kalman
+            + w2 * feat.covariance
+            + w1 * w2 * np.outer(full_dep_eps, full_dep_eps)
+        )
+
+        eigvals = np.linalg.eigvalsh(P_new)
+        if np.any(eigvals <= 0):
+            return
+
+        feat.position = lm_new.p
+        feat.covariance = P_new
+
+        denom1 = ab + 1.0
+        denom2 = denom1 * (ab + 2.0)
+        E_pi = (w1 * (a + 1.0) + w2 * a) / denom1
+        E_pi2 = (
+            w1 * (a + 1.0) * (a + 2.0)
+            + w2 * a * (a + 1.0)
+        ) / denom2
+        v_pi = E_pi2 - E_pi * E_pi
+
+        if v_pi < 1e-6 or E_pi <= 1e-6 or E_pi >= 1.0 - 1e-6:
+            new_a = a + w1
+            new_b = b + w2
+        else:
+            factor = E_pi * (1.0 - E_pi) / v_pi - 1.0
+            if factor < 0.5:
+                factor = 0.5
+            new_a = E_pi * factor
+            new_b = (1.0 - E_pi) * factor
+
+        feat.a = float(np.clip(new_a, s.ab_min, s.ab_max))
+        feat.b = float(np.clip(new_b, s.ab_min, s.ab_max))

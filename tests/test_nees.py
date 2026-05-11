@@ -23,10 +23,12 @@ import matplotlib.pyplot as plt
 from eqvio.sparse_vogiatzis import (
     SparseVogiatzisFilter,
     SparseVogiatzisFilter3D,
+    SparseVogiatzisFilterInvDepth3D,
     SparseVogSettings,
     DepthParametrization,
 )
 from eqvio.coordinate_suite.normal import point_chart_normal
+from eqvio.coordinate_suite.invdepth import conv_ind2euc, point_chart_invdepth
 from eqvio.mathematical.vision_measurement import VisionMeasurement
 from eqvio.mathematical.vio_state import Landmark
 
@@ -140,7 +142,7 @@ def _run_1d_nees(param, is_vog, data, z_true, init_depth_var=1.0):
     return nees, rel_err
 
 
-def _run_3d_nees(is_vog, data, z_true, init_depth_var=1.0):
+def _run_3d_nees(filter_cls, is_vog, data, z_true, init_depth_var=1.0):
     s = SparseVogSettings(
         a_init=10.0 if is_vog else 1e8,
         b_init=2.0 if is_vog else 1e-8,
@@ -151,7 +153,7 @@ def _run_3d_nees(is_vog, data, z_true, init_depth_var=1.0):
         process_depth_var=0.0,
         init_depth_var=init_depth_var,
     )
-    filt = SparseVogiatzisFilter3D(K_MAT, s)
+    filt = filter_cls(K_MAT, s)
 
     n = len(data) - 1
     nees = np.full(n, np.nan)
@@ -167,21 +169,48 @@ def _run_3d_nees(is_vog, data, z_true, init_depth_var=1.0):
             if feat and feat.depth > 1e-6:
                 q_true = P_C
                 q_est = feat.position
-                eps = point_chart_normal(
-                    Landmark(p=q_true, id=42),
-                    Landmark(p=q_est, id=42),
-                )
+                if filter_cls is SparseVogiatzisFilterInvDepth3D:
+                    eps, cov_nees = _camera_invdepth3d_error_and_cov(feat, q_true)
+                else:
+                    eps = point_chart_normal(
+                        Landmark(p=q_true, id=42),
+                        Landmark(p=q_est, id=42),
+                    )
+                    cov_nees = feat.covariance
                 try:
-                    P_inv = np.linalg.inv(feat.covariance)
+                    P_inv = np.linalg.inv(cov_nees)
                     nees[i - 1] = float(eps @ P_inv @ eps)
                 except np.linalg.LinAlgError:
                     pass
-                d_true = float(np.linalg.norm(P_C))
+                d_true = float(P_C[2]) if filter_cls is SparseVogiatzisFilterInvDepth3D else float(np.linalg.norm(P_C))
                 d_est = feat.depth
                 if d_est > 0 and d_true > 0:
                     rel_err[i - 1] = abs(d_est - d_true) / d_true
 
     return nees, rel_err
+
+
+def _camera_invdepth3d_error_and_cov(feat, q_true):
+    """Return local error/cov in [stereo bearing, 1 / camera_z].
+
+    SparseVogiatzisFilterInvDepth3D stores covariance in the repository's
+    inverse-depth chart, whose radial coordinate is inverse range.  The
+    sparse GB depth observation is 1 / camera_z, so the NEES diagnostic
+    should be evaluated in that observation-aligned radial coordinate.
+    """
+    q_est = feat.position
+    eps = point_chart_invdepth(
+        Landmark(p=q_true, id=feat.feat_id),
+        Landmark(p=q_est, id=feat.feat_id),
+    )
+    eps[2] = 1.0 / float(q_true[2]) - 1.0 / float(q_est[2])
+
+    M_ind2euc = conv_ind2euc(q_est)
+    H_zinv = np.array([[0.0, 0.0, -1.0 / (q_est[2] * q_est[2])]])
+    J = np.eye(3)
+    J[2, :] = (H_zinv @ M_ind2euc).reshape(3)
+    cov = J @ feat.covariance @ J.T
+    return eps, cov
 
 
 # ================================================================
@@ -196,7 +225,14 @@ def _run_mc(param_enum, param_name, is_vog, n_mc, n_steps, z_true,
         rng = np.random.default_rng(base_seed + mc)
         data = _gen_data(rng, n_steps, z_true, outlier_rate)
         if param_name == "polar3d":
-            all_nees[mc], all_rel_err[mc] = _run_3d_nees(is_vog, data, z_true, init_depth_var)
+            all_nees[mc], all_rel_err[mc] = _run_3d_nees(
+                SparseVogiatzisFilter3D, is_vog, data, z_true, init_depth_var,
+            )
+        elif param_name == "invdepth3d":
+            all_nees[mc], all_rel_err[mc] = _run_3d_nees(
+                SparseVogiatzisFilterInvDepth3D, is_vog, data, z_true,
+                init_depth_var,
+            )
         else:
             all_nees[mc], all_rel_err[mc] = _run_1d_nees(param_enum, is_vog, data, z_true, init_depth_var)
     return all_nees, all_rel_err
@@ -231,17 +267,19 @@ def main():
         (DepthParametrization.INVDEPTH, "invdepth"),
         (DepthParametrization.POLAR, "polar"),
         (None, "polar3d"),
+        (None, "invdepth3d"),
     ]
     colors = {
         "euclidean": "tab:blue",
         "invdepth": "tab:orange",
         "polar": "tab:green",
         "polar3d": "tab:red",
+        "invdepth3d": "tab:purple",
     }
 
     from scipy.stats import chi2
 
-    fig, axes = plt.subplots(3, 4, figsize=(18, 12), sharex=True)
+    fig, axes = plt.subplots(3, 5, figsize=(22, 12), sharex=True)
     mean_axes = axes[0]
     median_axes = axes[1]
     err_axes = axes[2]
@@ -251,7 +289,7 @@ def main():
         ax_mean = mean_axes[idx]
         ax_med = median_axes[idx]
         ax_e = err_axes[idx]
-        dim = 3 if p_name == "polar3d" else 1
+        dim = 3 if p_name in ("polar3d", "invdepth3d") else 1
 
         for is_vog, label, ls, lw in [
             (True, "Gaussian-Beta", "-", 1.5),
