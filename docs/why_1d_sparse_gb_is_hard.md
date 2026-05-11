@@ -66,3 +66,18 @@ paper effort claiming the 1D scalar GB filter is fully consistent at high
 altitude.  The stronger technical claim should be that preserving 3D landmark
 covariance makes the sparse long-range depth filter consistent while remaining
 far cheaper than in-state landmark augmentation.
+
+## GB Is Not The Main Win For 3D
+
+The 3D sparse variants also show that Gaussian-Beta modeling is not always the
+important part.  Once the filter keeps a full 3D landmark covariance and uses
+prediction plus bearing updates, the repeated scalar triangulated-depth
+observation is gone.  The measurement residual is the tracked pixel bearing
+residual, which has already been filtered by KLT/RANSAC-style tracking logic.
+
+In this setting, `polar3d / Gaussian-Beta` and `polar3d / Gaussian` are often
+nearly identical, and the same holds for `invdepth3d`.  That means the 3D
+result should not be framed as "GB makes the 3D filter work."  The better claim
+is that 3D covariance geometry makes the filter consistent; GB is mainly useful
+for scalar 1D filters that consume triangulated inverse-depth observations with
+heavier-tailed errors.
